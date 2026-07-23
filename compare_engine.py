@@ -38,12 +38,16 @@ def _normalize_hts(text: str) -> str:
 
 def compare_sku(new_sku: str, new_desc: str, new_hts: str,
                  master_df: pd.DataFrame,
-                 fuzzy_threshold: int = DEFAULT_FUZZY_THRESHOLD) -> dict:
+                 fuzzy_threshold: int = DEFAULT_FUZZY_THRESHOLD,
+                 new_tax_rate: str = "") -> dict:
     """
     比对单个 SKU。
 
     Args:
         master_df: 主数据库 DataFrame，至少包含 sku / description / hts 列
+        new_tax_rate: 本次 PL 解析出的税率（已格式化为 "6.5%" 这种字符串，可能为空）。
+            税率不参与 NEW/MATCH/MISMATCH 的判定，只是随比对结果一起带出来，
+            方便写入主数据库或展示。
 
     Returns:
         dict，描述比对结果，供上层汇总展示。
@@ -56,14 +60,17 @@ def compare_sku(new_sku: str, new_desc: str, new_hts: str,
             "status": "NEW",
             "new_description": new_desc,
             "new_hts": new_hts,
+            "new_tax_rate": new_tax_rate,
             "old_description": None,
             "old_hts": None,
+            "old_tax_rate": None,
             "desc_similarity": None,
         }
 
     old_row = existing.iloc[0]
     old_desc = old_row["description"]
     old_hts = old_row["hts"]
+    old_tax_rate = old_row["tax_rate"] if "tax_rate" in old_row else ""
 
     hts_match = _normalize_hts(new_hts) == _normalize_hts(old_hts)
     similarity = fuzz.token_sort_ratio(_normalize_desc(new_desc), _normalize_desc(old_desc))
@@ -76,13 +83,18 @@ def compare_sku(new_sku: str, new_desc: str, new_hts: str,
     else:
         status = "MATCH"
 
+    # 税率留空时不要用空值覆盖数据库里已有的税率（本次没读到税率不代表税率变了）
+    effective_new_tax_rate = new_tax_rate if new_tax_rate else old_tax_rate
+
     return {
         "sku": new_sku,
         "status": status,
         "new_description": new_desc,
         "new_hts": new_hts,
+        "new_tax_rate": effective_new_tax_rate,
         "old_description": old_desc,
         "old_hts": old_hts,
+        "old_tax_rate": old_tax_rate,
         "desc_similarity": round(similarity, 1),
     }
 
@@ -93,15 +105,18 @@ def compare_batch(new_records: pd.DataFrame, master_df: pd.DataFrame,
     批量比对一整份 PL 解析出的记录。
 
     Args:
-        new_records: columns = [sku, description, hts]
-        master_df:   columns = [sku, description, hts, ...其他元数据列]
+        new_records: columns = [sku, description, hts, tax_rate]（tax_rate 可选，没有就当空处理）
+        master_df:   columns = [sku, description, hts, tax_rate, ...其他元数据列]
 
     Returns:
         DataFrame，每行一个比对结果，包含 status / 新旧值 / 相似度
     """
+    has_tax_col = "tax_rate" in new_records.columns
     results = []
     for _, row in new_records.iterrows():
-        result = compare_sku(row["sku"], row["description"], row["hts"], master_df, fuzzy_threshold)
+        new_tax_rate = row["tax_rate"] if has_tax_col else ""
+        result = compare_sku(row["sku"], row["description"], row["hts"], master_df,
+                              fuzzy_threshold, new_tax_rate=new_tax_rate)
         results.append(result)
 
     return pd.DataFrame(results)

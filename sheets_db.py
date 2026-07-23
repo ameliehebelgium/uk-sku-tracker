@@ -30,7 +30,7 @@ SKU_MASTER_SHEET_NAME = "UK_SKU_Master"
 CHANGE_LOG_SHEET_NAME = "UK_Change_Log"
 
 SKU_MASTER_HEADERS = [
-    "sku", "description", "hts",
+    "sku", "description", "hts", "tax_rate",
     "first_seen_date", "last_updated_date", "source_po",
 ]
 
@@ -109,16 +109,20 @@ def append_new_skus(new_skus: pd.DataFrame, source_po: str):
     today = datetime.now().strftime("%Y-%m-%d")
     rows = []
     for _, row in new_skus.iterrows():
+        tax_rate = row["tax_rate"] if "tax_rate" in row and pd.notna(row["tax_rate"]) else ""
         rows.append([
-            row["sku"], row["description"], row["hts"],
+            row["sku"], row["description"], row["hts"], tax_rate,
             today, today, source_po or "",
         ])
 
     ws.append_rows(rows, value_input_option="USER_ENTERED")
 
 
-def update_sku_record(sku: str, new_description: str, new_hts: str, source_po: str):
-    """人工确认后，用新值覆盖 UK 主数据库中该 SKU 的记录。"""
+def update_sku_record(sku: str, new_description: str, new_hts: str, source_po: str,
+                       new_tax_rate: str | None = None):
+    """人工确认后，用新值覆盖 UK 主数据库中该 SKU 的记录。
+    new_tax_rate 为 None 或空字符串时不覆盖数据库里已有的税率（本次没读到税率不代表税率变了）。
+    """
     spreadsheet = _get_spreadsheet()
     ws = _get_or_create_worksheet(spreadsheet, SKU_MASTER_SHEET_NAME, SKU_MASTER_HEADERS)
 
@@ -128,6 +132,7 @@ def update_sku_record(sku: str, new_description: str, new_hts: str, source_po: s
     desc_col_idx = headers.index("description")
     hts_col_idx = headers.index("hts")
     last_updated_idx = headers.index("last_updated_date")
+    tax_col_idx = headers.index("tax_rate") if "tax_rate" in headers else None
 
     today = datetime.now().strftime("%Y-%m-%d")
 
@@ -135,6 +140,8 @@ def update_sku_record(sku: str, new_description: str, new_hts: str, source_po: s
         if len(row) > sku_col_idx and row[sku_col_idx].strip() == sku.strip():
             ws.update_cell(row_idx, desc_col_idx + 1, new_description)
             ws.update_cell(row_idx, hts_col_idx + 1, new_hts)
+            if new_tax_rate and tax_col_idx is not None:
+                ws.update_cell(row_idx, tax_col_idx + 1, new_tax_rate)
             ws.update_cell(row_idx, last_updated_idx + 1, today)
             return True
     return False

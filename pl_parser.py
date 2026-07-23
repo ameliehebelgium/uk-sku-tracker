@@ -1,12 +1,14 @@
 """
 Packing List 解析模块
-负责从上传的 PL Excel 文件中提取 SKU / 品名 (Description) / HTS Code 三元组。
+负责从上传的 PL Excel 文件中提取 SKU / 品名 (Description) / HTS Code / 税率 四元组。
 
 关键处理点：
 1. PL 格式不固定（表头行位置、列名可能变化），需要自动定位表头行。
 2. 同一产品多个 SKU 时，品名/HTS 经常只写在第一行，下面的行是空白（"继承"上一行的值），
    必须做 forward-fill，否则会被误判为"品名/HTS 缺失"或产生噪音预警。
 3. 自动跳过 TOTAL / 合计行、空行、签名行等非数据行。
+4. 税率列：很多 PL 模板里这一列没有文字表头（纯数字列），所以不能靠关键词识别。
+   采用"位置优先 + 自动侦测兜底"的策略，找不到就整列留空，不报错、不预警。
 """
 
 import pandas as pd
@@ -18,7 +20,14 @@ COLUMN_KEYWORDS = {
     "sku": ["sku"],
     "description": ["item description", "description", "product name", "品名", "货描", "item name"],
     "hts": ["hts", "hs code", "hscode", "h.t.s", "h.s.code", "海关编码", "商品编码"],
+    "tax_rate": ["tax rate", "duty rate", "税率", "关税税率", "duty%", "tax%"],
 }
+
+# 税率列没有文字表头时，按经验位置在 SKU 列右边第几列去尝试（0-indexed 偏移）
+TAX_RATE_POSITION_OFFSET = 2
+
+# 自动侦测税率列时，一列里"看起来像税率"（0~100 的数字）的行占比至少要达到这个比例
+TAX_RATE_DETECT_MIN_RATIO = 0.6
 
 
 def _find_header_row(raw_df: pd.DataFrame) -> int | None:
@@ -42,7 +51,9 @@ def _find_header_row(raw_df: pd.DataFrame) -> int | None:
 
 def _map_columns(header_row: pd.Series) -> dict:
     """
-    根据表头行的实际文本，把每一列映射到标准字段名 (sku / description / hts)。
+    根据表头行的实际文本，把每一列映射到标准字段名 (sku / description / hts / tax_rate)。
+    注意：税率列在多数模板里没有文字表头，所以这里通常映射不到 tax_rate，
+    需要靠 _locate_tax_rate_column 按位置/自动侦测补充。
     """
     mapping = {}
     for col_idx, raw_name in header_row.items():
@@ -54,6 +65,70 @@ def _map_columns(header_row: pd.Series) -> dict:
                     mapping[col_idx] = field
                 break
     return mapping
+
+
+def _parse_tax_value(val) -> float | None:
+    """把单个单元格解析成 0~100 的税率数字，解析不了或超出范围返回 None。"""
+    if pd.isna(val):
+        return None
+    if isinstance(val, (int, float)):
+        f = float(val)
+    else:
+        text = str(val).strip().replace("%", "").replace(",", ".")
+        if text == "":
+            return None
+        try:
+            f = float(text)
+        except ValueError:
+            return None
+    if 0 <= f <= 100:
+        return f
+    return None
+
+
+def _column_looks_like_tax_rate(series: pd.Series) -> bool:
+    """判断一列是否"看起来像税率"：多数非空值是 0~100 的数字。"""
+    non_null = series.dropna()
+    non_null = non_null[non_null.astype(str).str.strip() != ""]
+    if len(non_null) == 0:
+        return False
+    valid = sum(1 for v in non_null if _parse_tax_value(v) is not None)
+    return (valid / len(non_null)) >= TAX_RATE_DETECT_MIN_RATIO
+
+
+def _locate_tax_rate_column(raw: pd.DataFrame, header_idx: int, sku_col_idx: int,
+                             already_mapped_cols: set) -> int | None:
+    """
+    定位税率列，策略：位置优先，自动侦测兜底。
+    1. 先尝试 SKU 列右边第 TAX_RATE_POSITION_OFFSET 列（常见模板的经验位置）。
+    2. 不满足就往右扫描其余未被占用的列，找第一个"看起来像税率"的列。
+    3. 都找不到就返回 None（调用方留空，不报警）。
+    """
+    data_rows = raw.iloc[header_idx + 1:]
+    total_cols = raw.shape[1]
+
+    candidate = sku_col_idx + TAX_RATE_POSITION_OFFSET
+    if candidate < total_cols and candidate not in already_mapped_cols:
+        if _column_looks_like_tax_rate(data_rows[candidate]):
+            return candidate
+
+    for col_idx in range(sku_col_idx + 1, total_cols):
+        if col_idx in already_mapped_cols or col_idx == candidate:
+            continue
+        if _column_looks_like_tax_rate(data_rows[col_idx]):
+            return col_idx
+
+    return None
+
+
+def _format_tax_rate(val) -> str:
+    """把税率数字格式化成百分比字符串，如 6.5 -> '6.5%'，0 -> '0%'。找不到值返回空字符串。"""
+    f = _parse_tax_value(val)
+    if f is None:
+        return ""
+    if f == int(f):
+        return f"{int(f)}%"
+    return f"{f}%"
 
 
 def parse_packing_list(file_obj_or_path, po_number_hint: str | None = None) -> dict:
@@ -103,6 +178,16 @@ def parse_packing_list(file_obj_or_path, po_number_hint: str | None = None) -> d
         return {"success": False, "error": f"表头中缺少必要列：{', '.join(missing)}",
                 "po_number": po_number, "records": pd.DataFrame(), "warnings": warnings}
 
+    # ---- 2b. 定位税率列（大多数模板没有文字表头，位置优先+自动侦测兜底） ----
+    tax_col_idx = None
+    if "tax_rate" in found_fields:
+        # 表头文字里就写了"税率"/"tax rate"等关键词，直接用
+        tax_col_idx = [c for c, f in col_map.items() if f == "tax_rate"][0]
+    else:
+        sku_col_idx = [c for c, f in col_map.items() if f == "sku"][0]
+        already_mapped = set(col_map.keys())
+        tax_col_idx = _locate_tax_rate_column(raw, header_idx, sku_col_idx, already_mapped)
+
     # ---- 3. 提取数据区（表头下一行开始，到 TOTAL 行或空 SKU 截止） ----
     data = raw.iloc[header_idx + 1:].copy()
     data = data.reset_index(drop=True)
@@ -114,6 +199,11 @@ def parse_packing_list(file_obj_or_path, po_number_hint: str | None = None) -> d
         "description": data[field_to_col["description"]],
         "hts": data[field_to_col["hts"]],
     })
+    if tax_col_idx is not None:
+        extracted["tax_rate_raw"] = data[tax_col_idx]
+    else:
+        extracted["tax_rate_raw"] = pd.NA
+        warnings.append("未在文件中找到税率列，本次解析的税率将留空。")
 
     # 去掉 TOTAL / 合计 等汇总行，以及完全空白行
     def is_summary_or_blank(row) -> bool:
@@ -141,6 +231,11 @@ def parse_packing_list(file_obj_or_path, po_number_hint: str | None = None) -> d
     extracted["description"] = extracted["description"].ffill()
     extracted["hts"] = extracted["hts"].ffill()
 
+    # 税率同样按"同一产品多 SKU 继承上一行"的逻辑 forward-fill（找到税率列时才处理）
+    if tax_col_idx is not None:
+        extracted["tax_rate_raw"] = extracted["tax_rate_raw"].replace(r"^\s*$", pd.NA, regex=True)
+        extracted["tax_rate_raw"] = extracted["tax_rate_raw"].ffill()
+
     if before_fill_desc_blanks > 0 or before_fill_hts_blanks > 0:
         warnings.append(
             f"检测到 {before_fill_desc_blanks} 行品名为空、{before_fill_hts_blanks} 行 HTS 为空，"
@@ -160,6 +255,10 @@ def parse_packing_list(file_obj_or_path, po_number_hint: str | None = None) -> d
     extracted["hts"] = extracted["hts"].apply(normalize_hts)
     extracted["description"] = extracted["description"].astype(str).str.strip()
 
+    # 税率格式化为百分比字符串，如 6.5 -> "6.5%"；没有税率列或解析不了的留空，不报警
+    extracted["tax_rate"] = extracted["tax_rate_raw"].apply(_format_tax_rate)
+    extracted = extracted.drop(columns=["tax_rate_raw"])
+
     # 仍有缺失 HTS/description 的行，单独提示（forward-fill 后仍为空，说明文件第一行就缺失）
     still_missing = extracted[(extracted["hts"] == "") | (extracted["description"] == "") | (extracted["description"].str.lower() == "nan")]
     if not still_missing.empty:
@@ -177,6 +276,6 @@ def parse_packing_list(file_obj_or_path, po_number_hint: str | None = None) -> d
         "success": True,
         "error": None,
         "po_number": po_number,
-        "records": extracted[["sku", "description", "hts"]],
+        "records": extracted[["sku", "description", "hts", "tax_rate"]],
         "warnings": warnings,
     }
