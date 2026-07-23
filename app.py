@@ -229,7 +229,7 @@ with tab_check:
                     new_df[["sku", "new_description", "new_hts", "new_tax_rate"]].rename(columns={
                         "new_description": "品名", "new_hts": "HTS", "new_tax_rate": "税率"
                     }),
-                    use_container_width=True, hide_index=True,
+                    width='stretch', hide_index=True,
                 )
                 if st.button("✅ 确认写入这些新 SKU 到 UK 数据库", key=f"write_new_{fname}"):
                     append_new_skus(
@@ -239,7 +239,6 @@ with tab_check:
                         parse_result["po_number"],
                     )
                     st.success(f"已写入 {len(new_df)} 个新 SKU。")
-                    st.cache_resource.clear()
 
             mismatch_df = comparison_df[comparison_df["status"].isin(["HTS_MISMATCH", "DESC_MISMATCH"])]
             if not mismatch_df.empty:
@@ -298,7 +297,6 @@ with tab_check:
                                         })
                                     append_change_log(log_entries)
                                     st.session_state.resolved[resolve_key] = "updated"
-                                    st.cache_resource.clear()
                                     st.rerun()
                             with btn_col2:
                                 if st.button("❌ 忽略，保留原记录", key=f"ignore_{fname}_{sku}"):
@@ -342,7 +340,7 @@ with tab_database:
         )
         display_df = master_df[mask]
     st.caption(f"共 {len(master_df)} 条记录，当前显示 {len(display_df)} 条")
-    st.dataframe(display_df, use_container_width=True, hide_index=True)
+    st.dataframe(display_df, width='stretch', hide_index=True)
 
 # ---------------------------------------------------------------------------
 # Tab 3: 变更日志
@@ -354,4 +352,4 @@ with tab_log:
     if log_df.empty:
         st.info("暂无记录。")
     else:
-        st.dataframe(log_df.sort_values("timestamp", ascending=False), use_container_width=True, hide_index=True)
+        st.dataframe(log_df.sort_values("timestamp", ascending=False), width='stretch', hide_index=True)

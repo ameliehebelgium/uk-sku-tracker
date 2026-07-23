@@ -47,9 +47,14 @@ def _get_client():
     return gspread.authorize(creds)
 
 
+@st.cache_resource
 def _get_spreadsheet():
     """
     打开本系统专属的 UK Spreadsheet。
+    用 cache_resource 缓存住这个连接对象——client.open_by_key() 本身会消耗一次
+    Google Sheets API 的读配额，不缓存的话，每次 Streamlit 重新跑脚本（哪怕只是
+    点了个无关的按钮）都会重新打开一次，很容易把「每分钟读请求数」的免费额度打满。
+
     注意：secrets 中的 UK_SHEET_ID 必须指向一个独立于 EU Risk App 的
     全新 Google Sheet 文件，不能复用 EU 那边的 SHEET_ID。
     """
@@ -72,8 +77,14 @@ def _get_or_create_worksheet(spreadsheet, title: str, headers: list):
     return ws
 
 
+@st.cache_data(ttl=30, show_spinner=False)
 def load_sku_master() -> pd.DataFrame:
-    """读取 UK 主数据库，返回 DataFrame。若表为空，返回带正确列名的空 DataFrame。"""
+    """
+    读取 UK 主数据库，返回 DataFrame。若表为空，返回带正确列名的空 DataFrame。
+    缓存 30 秒——Streamlit 每次交互（哪怕点的是无关按钮）都会重新执行整个脚本，
+    没有缓存的话每次都要重新读一遍整张表，很容易触发 Google Sheets 的 429 读配额限制。
+    写入操作（新增/更新 SKU）之后会主动清掉这个缓存，保证下次读到的是最新数据。
+    """
     spreadsheet = _get_spreadsheet()
     ws = _get_or_create_worksheet(spreadsheet, SKU_MASTER_SHEET_NAME, SKU_MASTER_HEADERS)
     records = ws.get_all_records()
@@ -89,7 +100,9 @@ def load_sku_master() -> pd.DataFrame:
     return df
 
 
+@st.cache_data(ttl=30, show_spinner=False)
 def load_change_log() -> pd.DataFrame:
+    """同样缓存 30 秒，理由跟 load_sku_master 一样：避免每次脚本重跑都重新读表触发 429。"""
     spreadsheet = _get_spreadsheet()
     ws = _get_or_create_worksheet(spreadsheet, CHANGE_LOG_SHEET_NAME, CHANGE_LOG_HEADERS)
     records = ws.get_all_records()
@@ -116,6 +129,7 @@ def append_new_skus(new_skus: pd.DataFrame, source_po: str):
         ])
 
     ws.append_rows(rows, value_input_option="USER_ENTERED")
+    load_sku_master.clear()
 
 
 def update_sku_record(sku: str, new_description: str, new_hts: str, source_po: str,
@@ -143,6 +157,7 @@ def update_sku_record(sku: str, new_description: str, new_hts: str, source_po: s
             if new_tax_rate and tax_col_idx is not None:
                 ws.update_cell(row_idx, tax_col_idx + 1, new_tax_rate)
             ws.update_cell(row_idx, last_updated_idx + 1, today)
+            load_sku_master.clear()
             return True
     return False
 
@@ -164,3 +179,4 @@ def append_change_log(entries: list[dict]):
         ])
 
     ws.append_rows(rows, value_input_option="USER_ENTERED")
+    load_change_log.clear()
