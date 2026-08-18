@@ -44,8 +44,11 @@ CHANGE_LOG_HEADERS = [
 # 大概率能成功"的临时性错误，值得重试；其他错误（比如权限不对、表不存在）
 # 重试也没用，直接抛出交给上层处理。
 _RETRYABLE_STATUS_CODES = {429, 500, 503}
-_RETRY_MAX_ATTEMPTS = 5
-_RETRY_BASE_DELAY_SECONDS = 1.5
+# 429 是"每分钟"级别的配额，重试窗口要盖过 60 秒才有意义——之前 5 次、
+# 总共约 22 秒的重试窗口，遇到真的把当分钟配额打满的情况还是不够，
+# 这里加到 7 次、总共约 2 分钟，确保能等到配额窗口刷新。
+_RETRY_MAX_ATTEMPTS = 7
+_RETRY_BASE_DELAY_SECONDS = 2
 
 
 def _call_with_retry(func, *args, **kwargs):
@@ -108,6 +111,29 @@ def _get_or_create_worksheet(spreadsheet, title: str, headers: list):
     return ws
 
 
+@st.cache_resource
+def _get_sku_master_worksheet():
+    """
+    缓存住 UK_SKU_Master 这个 worksheet 的句柄。
+
+    背景：_get_or_create_worksheet 每次被调用都要发 2 个读请求（按名字查找
+    worksheet + 检查表头行是否存在），而这套代码里几乎每个数据库操作函数
+    （读主数据库、写新 SKU、改记录、批量补税率……）都各自独立调用了一次——
+    也就是说光是"找到这张表"这个动作，一次交互里就可能被重复发起好几次
+    请求，很容易在使用高峰期打满 Google 的「每分钟读请求数」配额（这正是
+    实测中真实报错的原因：APIError 429, Read requests per minute per user）。
+    worksheet 的身份基本不会变，缓存成 cache_resource（跟应用进程同生命周期），
+    这个查找动作整个部署周期只会真正发生一次。
+    """
+    return _get_or_create_worksheet(_get_spreadsheet(), SKU_MASTER_SHEET_NAME, SKU_MASTER_HEADERS)
+
+
+@st.cache_resource
+def _get_change_log_worksheet():
+    """缓存住 UK_Change_Log 这个 worksheet 的句柄，理由同 _get_sku_master_worksheet。"""
+    return _get_or_create_worksheet(_get_spreadsheet(), CHANGE_LOG_SHEET_NAME, CHANGE_LOG_HEADERS)
+
+
 @st.cache_data(ttl=30, show_spinner=False)
 def load_sku_master() -> pd.DataFrame:
     """
@@ -116,8 +142,7 @@ def load_sku_master() -> pd.DataFrame:
     没有缓存的话每次都要重新读一遍整张表，很容易触发 Google Sheets 的 429 读配额限制。
     写入操作（新增/更新 SKU）之后会主动清掉这个缓存，保证下次读到的是最新数据。
     """
-    spreadsheet = _get_spreadsheet()
-    ws = _get_or_create_worksheet(spreadsheet, SKU_MASTER_SHEET_NAME, SKU_MASTER_HEADERS)
+    ws = _get_sku_master_worksheet()
     records = _call_with_retry(ws.get_all_records)
     if not records:
         return pd.DataFrame(columns=SKU_MASTER_HEADERS)
@@ -134,12 +159,22 @@ def load_sku_master() -> pd.DataFrame:
 @st.cache_data(ttl=30, show_spinner=False)
 def load_change_log() -> pd.DataFrame:
     """同样缓存 30 秒，理由跟 load_sku_master 一样：避免每次脚本重跑都重新读表触发 429。"""
-    spreadsheet = _get_spreadsheet()
-    ws = _get_or_create_worksheet(spreadsheet, CHANGE_LOG_SHEET_NAME, CHANGE_LOG_HEADERS)
+    ws = _get_change_log_worksheet()
     records = _call_with_retry(ws.get_all_records)
     if not records:
         return pd.DataFrame(columns=CHANGE_LOG_HEADERS)
-    return pd.DataFrame(records)
+
+    df = pd.DataFrame(records)
+    # old_value / new_value 这两列可能混着数字（比如 HTS 编码）和文字（比如
+    # 税率百分比字符串），Google Sheets 按"看起来像不像数字"逐个单元格自动
+    # 判断类型，同一列里就可能一部分是 int、一部分是 str。这种混合类型的
+    # object 列，Streamlit 用 st.dataframe 展示时转成 Arrow 表会报错
+    # （ArrowTypeError: Expected bytes, got a 'int' object）。统一转成字符串，
+    # 展示不受影响，也不会再报错。
+    for col in ("old_value", "new_value"):
+        if col in df.columns:
+            df[col] = df[col].apply(lambda v: "" if v is None or (isinstance(v, float) and pd.isna(v)) else str(v))
+    return df
 
 
 def append_new_skus(new_skus: pd.DataFrame, source_po: str):
@@ -147,8 +182,7 @@ def append_new_skus(new_skus: pd.DataFrame, source_po: str):
     if new_skus.empty:
         return
 
-    spreadsheet = _get_spreadsheet()
-    ws = _get_or_create_worksheet(spreadsheet, SKU_MASTER_SHEET_NAME, SKU_MASTER_HEADERS)
+    ws = _get_sku_master_worksheet()
 
     today = datetime.now().strftime("%Y-%m-%d")
     rows = []
@@ -173,8 +207,7 @@ def update_sku_record(sku: str, new_description: str, new_hts: str, source_po: s
     SKU 连续调用——很容易在几秒内打满 Google 的每分钟请求配额，触发 429
     报错（APIError）。批量场景请用 bulk_update_tax_rates。
     """
-    spreadsheet = _get_spreadsheet()
-    ws = _get_or_create_worksheet(spreadsheet, SKU_MASTER_SHEET_NAME, SKU_MASTER_HEADERS)
+    ws = _get_sku_master_worksheet()
 
     all_values = _call_with_retry(ws.get_all_values)
     headers = all_values[0]
@@ -225,8 +258,7 @@ def bulk_update_tax_rates(updates: list[dict]) -> int:
     if not updates:
         return 0
 
-    spreadsheet = _get_spreadsheet()
-    ws = _get_or_create_worksheet(spreadsheet, SKU_MASTER_SHEET_NAME, SKU_MASTER_HEADERS)
+    ws = _get_sku_master_worksheet()
 
     all_values = _call_with_retry(ws.get_all_values)
     if not all_values:
@@ -273,8 +305,7 @@ def append_change_log(entries: list[dict]):
     if not entries:
         return
 
-    spreadsheet = _get_spreadsheet()
-    ws = _get_or_create_worksheet(spreadsheet, CHANGE_LOG_SHEET_NAME, CHANGE_LOG_HEADERS)
+    ws = _get_change_log_worksheet()
 
     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     rows = []
