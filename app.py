@@ -18,7 +18,7 @@ from pl_parser import parse_packing_list
 from compare_engine import compare_batch, summarize_comparison, DEFAULT_FUZZY_THRESHOLD
 from sheets_db import (
     load_sku_master, load_change_log,
-    append_new_skus, update_sku_record, append_change_log,
+    append_new_skus, update_sku_record, append_change_log, bulk_update_tax_rates,
 )
 
 st.set_page_config(page_title="UK SKU 比对预警系统", page_icon="🇬🇧", layout="wide")
@@ -175,19 +175,21 @@ with tab_check:
                             # 税率从空值补全为具体数值：品名、HTS 都没变，不是冲突，
                             # 不需要人工逐条确认，这里直接写入数据库。只在"开始解析与比对"
                             # 这次点击里跑一次，不会随其他按钮的页面刷新重复写入。
+                            # 用批量写入（bulk_update_tax_rates），而不是对每个 SKU 单独
+                            # 调用 update_sku_record——后者一个 SKU 就要发好几个 Google
+                            # Sheets API 请求，一批几十个 SKU 循环调用很容易在几秒内打满
+                            # 每分钟请求配额、触发 429 报错。
                             autofill_df = comparison_df[comparison_df["status"] == "TAX_AUTOFILL"]
                             if not autofill_df.empty:
-                                log_entries = []
-                                for _, row in autofill_df.iterrows():
-                                    update_sku_record(
-                                        row["sku"], row["new_description"], row["new_hts"],
-                                        parse_result["po_number"], new_tax_rate=row["new_tax_rate"],
-                                    )
-                                    log_entries.append({
-                                        "sku": row["sku"], "field_changed": "tax_rate",
-                                        "old_value": row["old_tax_rate"], "new_value": row["new_tax_rate"],
-                                        "source_po": parse_result["po_number"], "resolution": "auto_filled",
-                                    })
+                                bulk_update_tax_rates([
+                                    {"sku": row["sku"], "tax_rate": row["new_tax_rate"]}
+                                    for _, row in autofill_df.iterrows()
+                                ])
+                                log_entries = [{
+                                    "sku": row["sku"], "field_changed": "tax_rate",
+                                    "old_value": row["old_tax_rate"], "new_value": row["new_tax_rate"],
+                                    "source_po": parse_result["po_number"], "resolution": "auto_filled",
+                                } for _, row in autofill_df.iterrows()]
                                 append_change_log(log_entries)
                                 total_autofilled += len(autofill_df)
                         file_results[fname] = {

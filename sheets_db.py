@@ -136,6 +136,11 @@ def update_sku_record(sku: str, new_description: str, new_hts: str, source_po: s
                        new_tax_rate: str | None = None):
     """人工确认后，用新值覆盖 UK 主数据库中该 SKU 的记录。
     new_tax_rate 为 None 或空字符串时不覆盖数据库里已有的税率（本次没读到税率不代表税率变了）。
+
+    这个函数每次调用要发好几个 Google Sheets API 请求（1 次读表 + 最多 4 次
+    单元格写入），单条人工确认点一次按钮没问题，但不适合在循环里对着一批
+    SKU 连续调用——很容易在几秒内打满 Google 的每分钟请求配额，触发 429
+    报错（APIError）。批量场景请用 bulk_update_tax_rates。
     """
     spreadsheet = _get_spreadsheet()
     ws = _get_or_create_worksheet(spreadsheet, SKU_MASTER_SHEET_NAME, SKU_MASTER_HEADERS)
@@ -160,6 +165,69 @@ def update_sku_record(sku: str, new_description: str, new_hts: str, source_po: s
             load_sku_master.clear()
             return True
     return False
+
+
+def bulk_update_tax_rates(updates: list[dict]) -> int:
+    """
+    批量把税率写入 UK_SKU_Master，用于"税率从空值自动补全"这种一次上传里
+    可能牵涉几十个 SKU 的场景。
+
+    跟 update_sku_record 逐个 SKU 调用不同，这里只发 3 个 Google Sheets API
+    请求（打开表 + 读一次全表 + 一次性批量写入所有改动的单元格），不管
+    updates 里有多少条，请求数都不会涨——避免像逐条调用 update_sku_record
+    那样，在一批几十个 SKU 的场景里几秒内打满 Google 的每分钟请求配额、
+    触发 429 报错。
+
+    Args:
+        updates: [{"sku": ..., "tax_rate": "2.7%"}, ...]
+
+    Returns:
+        实际找到并更新的行数（在表里找不到的 SKU 会被跳过，不报错）。
+    """
+    if not updates:
+        return 0
+
+    spreadsheet = _get_spreadsheet()
+    ws = _get_or_create_worksheet(spreadsheet, SKU_MASTER_SHEET_NAME, SKU_MASTER_HEADERS)
+
+    all_values = ws.get_all_values()
+    if not all_values:
+        return 0
+    headers = all_values[0]
+    if "sku" not in headers or "tax_rate" not in headers:
+        return 0
+    sku_col_idx = headers.index("sku")
+    tax_col_idx = headers.index("tax_rate")
+    last_updated_idx = headers.index("last_updated_date") if "last_updated_date" in headers else None
+
+    sku_to_row = {}
+    for row_idx, row in enumerate(all_values[1:], start=2):
+        if len(row) > sku_col_idx and row[sku_col_idx].strip():
+            sku_to_row[row[sku_col_idx].strip()] = row_idx
+
+    today = datetime.now().strftime("%Y-%m-%d")
+    batch_data = []
+    updated_count = 0
+    for u in updates:
+        row_idx = sku_to_row.get(str(u["sku"]).strip())
+        if row_idx is None:
+            continue
+        batch_data.append({
+            "range": gspread.utils.rowcol_to_a1(row_idx, tax_col_idx + 1),
+            "values": [[u["tax_rate"]]],
+        })
+        if last_updated_idx is not None:
+            batch_data.append({
+                "range": gspread.utils.rowcol_to_a1(row_idx, last_updated_idx + 1),
+                "values": [[today]],
+            })
+        updated_count += 1
+
+    if batch_data:
+        ws.batch_update(batch_data, value_input_option="USER_ENTERED")
+        load_sku_master.clear()
+
+    return updated_count
 
 
 def append_change_log(entries: list[dict]):
