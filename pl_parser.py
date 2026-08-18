@@ -8,11 +8,18 @@ Packing List 解析模块
    必须做 forward-fill，否则会被误判为"品名/HTS 缺失"或产生噪音预警。
 3. 自动跳过 TOTAL / 合计行、空行、签名行等非数据行。
 4. 税率列：很多 PL 模板里这一列没有文字表头（纯数字列），所以不能靠关键词识别，
-   采用"收集候选列 + 取最靠右一列"的策略（见 _locate_tax_rate_column），找不到就整列留空，不报错、不预警。
+   而且往往紧挨着一列"税额/税金"（金额，而不是税率），两列数值都落在能通过
+   "像百分比"检测的范围里。采用"候选列中取值最容易重复的一列"的策略
+   （见 _locate_tax_rate_column）：税率本质上是按 HTS 分类挂钩的，取值范围
+   很有限，会在同一批货里大量重复；税额是数量×单价×税率算出来的连续型金额，
+   几乎每行都不同。找不到候选列时整列留空，不报错、不预警。
 5. 有些文件是「发票 / 箱单 / 合同」三个表格放在同一个 xlsx 的不同 sheet 里
    （新增支持的格式），这种情况下必须只解析「箱单」(Packing List) 这个 sheet——
    发票、合同两个 sheet 的行结构完全不同，读它们会得到错误数据甚至解析失败。
    单 sheet 的旧格式文件不受影响，会自动退回读第一个 sheet。
+6. SKU 列有时候表头是空白的（模板里就没写"SKU"这几个字），这种情况下改用数据
+   特征来定位：SKU 几乎每一行都有值（哪怕品名/HTS 因为同产品多 SKU 只在第一行
+   填写），而且基本不是纯数字——在 HTS 列右边找符合这两个特征的第一列。
 """
 
 import pandas as pd
@@ -56,10 +63,16 @@ def _select_target_sheet(sheet_names: list) -> str:
 
 def _find_header_row(raw_df: pd.DataFrame) -> int | None:
     """
-    扫描原始 DataFrame（无表头读入），找到同时包含 SKU / Description / HTS
-    关键词的那一行，作为真正的表头行索引。
+    扫描原始 DataFrame（无表头读入），找到表头行索引。
+
+    优先找同时包含 SKU / Description / HTS 关键词的行；但有些模板里 SKU
+    这一列的表头是空白的（不像"Item Description"/"HTS"那样写了文字），
+    这种情况下退而求其次，只要同时有 Description / HTS 关键词就先记下来，
+    整个文件扫完都没找到"三者都有"的行时，就用这个退而求其次的候选行
+    （SKU 列会在后面用数据特征去定位，见 _locate_sku_column）。
     """
     max_scan_rows = min(50, len(raw_df))
+    relaxed_candidate = None
     for row_idx in range(max_scan_rows):
         row_values = [str(v).lower() for v in raw_df.iloc[row_idx].tolist()]
         row_text = " | ".join(row_values)
@@ -68,9 +81,11 @@ def _find_header_row(raw_df: pd.DataFrame) -> int | None:
         has_desc = any(kw in row_text for kw in COLUMN_KEYWORDS["description"])
         has_hts = any(kw in row_text for kw in COLUMN_KEYWORDS["hts"])
 
-        if has_sku and has_desc and has_hts:
+        if has_desc and has_hts and has_sku:
             return row_idx
-    return None
+        if has_desc and has_hts and relaxed_candidate is None:
+            relaxed_candidate = row_idx
+    return relaxed_candidate
 
 
 def _map_columns(header_row: pd.Series) -> dict:
@@ -136,27 +151,92 @@ def _column_looks_like_tax_rate(series: pd.Series) -> bool:
     return (valid / len(non_null)) >= TAX_RATE_DETECT_MIN_RATIO
 
 
+def _distinct_value_ratio(series: pd.Series) -> float:
+    """
+    非空值里"不重复值"的占比，越低说明这一列的取值越容易重复。
+    用来把"税率"（取值范围有限、大量重复）和"税额/税金"（几乎每行都不同的
+    连续型金额）区分开——两者往往都落在 0~100 区间，单看数值范围分不出来。
+    """
+    non_null = series.dropna()
+    non_null = non_null[non_null.astype(str).str.strip() != ""]
+    if len(non_null) == 0:
+        return 1.0
+    return non_null.nunique() / len(non_null)
+
+
 def _locate_tax_rate_column(raw: pd.DataFrame, header_idx: int, sku_col_idx: int,
                              already_mapped_cols: set) -> int | None:
     """
-    定位税率列。策略：收集 SKU 列右边所有"看起来像税率"的候选列，优先取最靠右的一列。
+    定位税率列。策略：收集 SKU 列右边所有"看起来像税率"的候选列，
+    取"不重复值占比最低"（最容易重复）的一列；占比相同时取最靠右的一列。
 
-    这么做的原因：新格式（发票/箱单/合同 三表合一）里，SKU 列右边依次是
-    「本 SKU 数量」「单件重量」「分摊金额」「税率」等好几列数值，其中不少
-    也恰好落在 0~100 区间、会被误判成"像税率"；但税率始终是表格最后一列，
-    取最靠右的候选可以稳定避开这些干扰列。
-    旧格式的简单模板通常 SKU 右边只有一列数值符合条件，取最右一列结果不变，
-    完全向后兼容。
+    这么做的原因：这类模板里 SKU 列右边常常同时有好几列数值——「本 SKU 数量」
+    「单件重量」「税率」「税额/税金」等，其中不少也恰好落在 0~100 区间、
+    会被误判成"像税率"。真正的税率本质上是按 HTS 分类挂钩的，取值范围很
+    有限，同一批货的不同 SKU 之间会大量重复；而"税额/税金"是数量×单价×
+    税率算出来的连续型金额，几乎每行都不一样。所以取重复率最高（不重复值
+    占比最低）的候选列，比单纯"取最靠右一列"更可靠。
     都找不到候选列时返回 None（调用方留空，不报警）。
     """
     data_rows = raw.iloc[header_idx + 1:]
     total_cols = raw.shape[1]
 
-    candidates = [
-        col_idx for col_idx in range(sku_col_idx + 1, total_cols)
-        if col_idx not in already_mapped_cols and _column_looks_like_tax_rate(data_rows[col_idx])
-    ]
-    return candidates[-1] if candidates else None
+    candidates = []
+    for col_idx in range(sku_col_idx + 1, total_cols):
+        if col_idx in already_mapped_cols:
+            continue
+        col = data_rows[col_idx]
+        if not _column_looks_like_tax_rate(col):
+            continue
+        candidates.append((_distinct_value_ratio(col), col_idx))
+
+    if not candidates:
+        return None
+    # 不重复值占比最低的优先；占比相同时取列索引最大的（最靠右）
+    candidates.sort(key=lambda pair: (pair[0], -pair[1]))
+    return candidates[0][1]
+
+
+def _looks_purely_numeric(val) -> bool:
+    """判断一个单元格值是否是"纯数字"（int/float，或能直接转成 float 的字符串）。"""
+    if pd.isna(val):
+        return False
+    if isinstance(val, (int, float)):
+        return True
+    try:
+        float(str(val).strip())
+        return True
+    except ValueError:
+        return False
+
+
+def _locate_sku_column(raw: pd.DataFrame, header_idx: int, hts_col_idx: int,
+                        already_mapped_cols: set) -> int | None:
+    """
+    定位 SKU 列（用于表头文字里没有写"SKU"的模板）。
+
+    策略：SKU 在这类模板里几乎每一行都有值——哪怕这一行的品名/HTS 是靠
+    forward-fill 从上一行继承的（同一产品多个 SKU 只在第一行写品名/HTS），
+    SKU 本身仍然逐行填写；而且 SKU 的值基本不是纯数字（都是字母+数字混合
+    的编码）。在 HTS 列右边找同时满足"非空率高"和"基本不是纯数字"这两个
+    条件的第一列。找不到时返回 None（调用方会报"缺少必要列"错误）。
+    """
+    data_rows = raw.iloc[header_idx + 1:]
+    total_cols = raw.shape[1]
+
+    for col_idx in range(hts_col_idx + 1, total_cols):
+        if col_idx in already_mapped_cols:
+            continue
+        col = data_rows[col_idx]
+        non_null = col.dropna()
+        non_null = non_null[non_null.astype(str).str.strip() != ""]
+        if len(non_null) == 0 or len(col) == 0:
+            continue
+        fill_ratio = len(non_null) / len(col)
+        textual_ratio = (~non_null.apply(_looks_purely_numeric)).mean()
+        if fill_ratio >= 0.7 and textual_ratio >= 0.8:
+            return col_idx
+    return None
 
 
 def _format_tax_rate(val) -> str:
@@ -213,6 +293,15 @@ def parse_packing_list(file_obj_or_path, po_number_hint: str | None = None) -> d
 
     header_row = raw.iloc[header_idx]
     col_map = _map_columns(header_row)
+
+    # SKU 列表头有时是空白的（没写"SKU"这几个字），文字关键词匹配不到时，
+    # 退而用数据特征（非空率高 + 基本不是纯数字）在 HTS 列右边找。
+    if "sku" not in col_map.values() and "hts" in col_map.values():
+        hts_col_idx = [c for c, f in col_map.items() if f == "hts"][0]
+        sku_col_idx = _locate_sku_column(raw, header_idx, hts_col_idx, set(col_map.keys()))
+        if sku_col_idx is not None:
+            col_map[sku_col_idx] = "sku"
+            warnings.append("SKU 列没有文字表头，已根据数据特征自动定位。")
 
     required_fields = {"sku", "description", "hts"}
     found_fields = set(col_map.values())
