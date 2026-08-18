@@ -7,8 +7,12 @@ Packing List 解析模块
 2. 同一产品多个 SKU 时，品名/HTS 经常只写在第一行，下面的行是空白（"继承"上一行的值），
    必须做 forward-fill，否则会被误判为"品名/HTS 缺失"或产生噪音预警。
 3. 自动跳过 TOTAL / 合计行、空行、签名行等非数据行。
-4. 税率列：很多 PL 模板里这一列没有文字表头（纯数字列），所以不能靠关键词识别。
-   采用"位置优先 + 自动侦测兜底"的策略，找不到就整列留空，不报错、不预警。
+4. 税率列：很多 PL 模板里这一列没有文字表头（纯数字列），所以不能靠关键词识别，
+   采用"收集候选列 + 取最靠右一列"的策略（见 _locate_tax_rate_column），找不到就整列留空，不报错、不预警。
+5. 有些文件是「发票 / 箱单 / 合同」三个表格放在同一个 xlsx 的不同 sheet 里
+   （新增支持的格式），这种情况下必须只解析「箱单」(Packing List) 这个 sheet——
+   发票、合同两个 sheet 的行结构完全不同，读它们会得到错误数据甚至解析失败。
+   单 sheet 的旧格式文件不受影响，会自动退回读第一个 sheet。
 """
 
 import pandas as pd
@@ -23,11 +27,31 @@ COLUMN_KEYWORDS = {
     "tax_rate": ["tax rate", "duty rate", "税率", "关税税率", "duty%", "tax%"],
 }
 
-# 税率列没有文字表头时，按经验位置在 SKU 列右边第几列去尝试（0-indexed 偏移）
-TAX_RATE_POSITION_OFFSET = 2
-
 # 自动侦测税率列时，一列里"看起来像税率"（0~100 的数字）的行占比至少要达到这个比例
 TAX_RATE_DETECT_MIN_RATIO = 0.6
+
+# 多 sheet 文件（例如「发票/箱单/合同」三表合一）中，用于识别「箱单」这个 sheet 的关键词
+PACKING_LIST_SHEET_HINTS = ["箱单", "装箱单", "packing list", "packing-list", "packinglist"]
+
+
+def _select_target_sheet(sheet_names: list) -> str:
+    """
+    从工作簿的所有 sheet 名称中，挑出真正的「箱单」(Packing List) sheet。
+
+    背景：新格式的文件把「发票」「箱单」「合同」三个表格放在同一个 xlsx 的
+    三个不同 sheet 里，只有「箱单」这个 sheet 才是逐条列出 SKU/品名/HTS/税率
+    的表格，必须精确定位到它，不能再默认读第一个 sheet（第一个 sheet 很可能
+    是「发票」，表头列名和数据结构都不一样，会导致解析失败或读出错误数据）。
+
+    旧格式的文件通常只有一个 sheet，这里找不到匹配的名字时会自动退回
+    第一个 sheet，行为和以前完全一致，不影响旧格式。
+    """
+    for name in sheet_names:
+        name_norm = str(name).strip().lower()
+        for hint in PACKING_LIST_SHEET_HINTS:
+            if hint.lower() in name_norm:
+                return name
+    return sheet_names[0]
 
 
 def _find_header_row(raw_df: pd.DataFrame) -> int | None:
@@ -68,9 +92,23 @@ def _map_columns(header_row: pd.Series) -> dict:
 
 
 def _parse_tax_value(val) -> float | None:
-    """把单个单元格解析成 0~100 的税率数字，解析不了或超出范围返回 None。"""
+    """
+    把单元格解析成 0~100 的税率数字，解析不了或超出范围返回 None。
+
+    这里要处理两种历史遗留的存储方式：
+    1. 单元格本身就是"6.5"这种已经是百分比数值的数字（数字类型或字符串都可能）。
+    2. 单元格被 Excel 设置成"百分比"格式，底层实际存的是 0.065 这种小数
+       （Excel 界面上显示成 6.50%，但 pandas/openpyxl 读出来的浮点数就是
+       0.065）——这种情况必须乘以 100 换算成 6.5，否则会变成离谱的 0.065%。
+
+    区分方法：如果单元格文本里带 "%" 符号，说明是按"百分号前面的数字就是
+    百分比数值"这个约定填的（例如字符串 "6.5%"），不需要再乘 100；
+    没带 "%" 符号、且解析出的数值在 0~1 之间（不含 1），大概率是 Excel 百分比
+    格式单元格底层的小数，需要乘以 100 换算成真正的百分比数值。
+    """
     if pd.isna(val):
         return None
+    has_percent_sign = isinstance(val, str) and "%" in val
     if isinstance(val, (int, float)):
         f = float(val)
     else:
@@ -81,8 +119,10 @@ def _parse_tax_value(val) -> float | None:
             f = float(text)
         except ValueError:
             return None
+    if not has_percent_sign and 0 < f < 1:
+        f = f * 100
     if 0 <= f <= 100:
-        return f
+        return round(f, 4)
     return None
 
 
@@ -99,26 +139,24 @@ def _column_looks_like_tax_rate(series: pd.Series) -> bool:
 def _locate_tax_rate_column(raw: pd.DataFrame, header_idx: int, sku_col_idx: int,
                              already_mapped_cols: set) -> int | None:
     """
-    定位税率列，策略：位置优先，自动侦测兜底。
-    1. 先尝试 SKU 列右边第 TAX_RATE_POSITION_OFFSET 列（常见模板的经验位置）。
-    2. 不满足就往右扫描其余未被占用的列，找第一个"看起来像税率"的列。
-    3. 都找不到就返回 None（调用方留空，不报警）。
+    定位税率列。策略：收集 SKU 列右边所有"看起来像税率"的候选列，优先取最靠右的一列。
+
+    这么做的原因：新格式（发票/箱单/合同 三表合一）里，SKU 列右边依次是
+    「本 SKU 数量」「单件重量」「分摊金额」「税率」等好几列数值，其中不少
+    也恰好落在 0~100 区间、会被误判成"像税率"；但税率始终是表格最后一列，
+    取最靠右的候选可以稳定避开这些干扰列。
+    旧格式的简单模板通常 SKU 右边只有一列数值符合条件，取最右一列结果不变，
+    完全向后兼容。
+    都找不到候选列时返回 None（调用方留空，不报警）。
     """
     data_rows = raw.iloc[header_idx + 1:]
     total_cols = raw.shape[1]
 
-    candidate = sku_col_idx + TAX_RATE_POSITION_OFFSET
-    if candidate < total_cols and candidate not in already_mapped_cols:
-        if _column_looks_like_tax_rate(data_rows[candidate]):
-            return candidate
-
-    for col_idx in range(sku_col_idx + 1, total_cols):
-        if col_idx in already_mapped_cols or col_idx == candidate:
-            continue
-        if _column_looks_like_tax_rate(data_rows[col_idx]):
-            return col_idx
-
-    return None
+    candidates = [
+        col_idx for col_idx in range(sku_col_idx + 1, total_cols)
+        if col_idx not in already_mapped_cols and _column_looks_like_tax_rate(data_rows[col_idx])
+    ]
+    return candidates[-1] if candidates else None
 
 
 def _format_tax_rate(val) -> str:
@@ -147,10 +185,15 @@ def parse_packing_list(file_obj_or_path, po_number_hint: str | None = None) -> d
     warnings = []
 
     try:
-        raw = pd.read_excel(file_obj_or_path, header=None, sheet_name=0)
+        xls = pd.ExcelFile(file_obj_or_path)
+        target_sheet = _select_target_sheet(xls.sheet_names)
+        raw = xls.parse(sheet_name=target_sheet, header=None)
     except Exception as e:
         return {"success": False, "error": f"无法读取 Excel 文件：{e}", "po_number": None,
                 "records": pd.DataFrame(), "warnings": warnings}
+
+    if len(xls.sheet_names) > 1:
+        warnings.append(f"该文件包含多个 sheet（{', '.join(xls.sheet_names)}），已自动定位并只解析「{target_sheet}」。")
 
     # ---- 1. 尝试提取 PO / 箱单号（用于来源追溯） ----
     po_number = po_number_hint

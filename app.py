@@ -216,11 +216,12 @@ with tab_check:
             st.caption(f"来源 PO/箱单号：{parse_result['po_number'] or '未识别'}")
 
             summary = summarize_comparison(comparison_df)
-            c1, c2, c3, c4 = st.columns(4)
+            c1, c2, c3, c4, c5 = st.columns(5)
             c1.metric("总 SKU 数", summary["total"])
             c2.metric("✅ 一致", summary["match"])
             c3.metric("🔴 HTS 不一致", summary["hts_mismatch"])
             c4.metric("🟡 品名不一致", summary["desc_mismatch"])
+            c5.metric("🔵 税率不一致", summary["tax_mismatch"])
 
             new_df = comparison_df[comparison_df["status"] == "NEW"]
             if not new_df.empty:
@@ -240,7 +241,9 @@ with tab_check:
                     )
                     st.success(f"已写入 {len(new_df)} 个新 SKU。")
 
-            mismatch_df = comparison_df[comparison_df["status"].isin(["HTS_MISMATCH", "DESC_MISMATCH"])]
+            mismatch_df = comparison_df[comparison_df["status"].isin(
+                ["HTS_MISMATCH", "DESC_MISMATCH", "TAX_MISMATCH"]
+            )]
             if not mismatch_df.empty:
                 st.markdown(f"#### ⚠️ 差异预警（{len(mismatch_df)} 个）— 请逐条确认处理方式")
 
@@ -249,8 +252,12 @@ with tab_check:
                     resolve_key = (fname, sku)
                     already_resolved = st.session_state.resolved.get(resolve_key)
 
-                    icon = "🔴" if row["status"] == "HTS_MISMATCH" else "🟡"
-                    label = "HTS 不一致" if row["status"] == "HTS_MISMATCH" else f"品名不一致（相似度 {row['desc_similarity']}）"
+                    if row["status"] == "HTS_MISMATCH":
+                        icon, label = "🔴", "HTS 不一致"
+                    elif row["status"] == "DESC_MISMATCH":
+                        icon, label = "🟡", f"品名不一致（相似度 {row['desc_similarity']}）"
+                    else:
+                        icon, label = "🔵", f"税率不一致（{row['old_tax_rate'] or '（空）'} → {row['new_tax_rate']}）"
 
                     with st.container(border=True):
                         st.markdown(f"{icon} **{sku}** — {label}")
@@ -300,17 +307,22 @@ with tab_check:
                                     st.rerun()
                             with btn_col2:
                                 if st.button("❌ 忽略，保留原记录", key=f"ignore_{fname}_{sku}"):
-                                    field = "hts" if row["status"] == "HTS_MISMATCH" else "description"
+                                    if row["status"] == "HTS_MISMATCH":
+                                        field, old_val, new_val = "hts", row["old_hts"], row["new_hts"]
+                                    elif row["status"] == "DESC_MISMATCH":
+                                        field, old_val, new_val = "description", row["old_description"], row["new_description"]
+                                    else:
+                                        field, old_val, new_val = "tax_rate", row["old_tax_rate"], row["new_tax_rate"]
                                     append_change_log([{
                                         "sku": sku, "field_changed": field,
-                                        "old_value": row["old_hts"] if field == "hts" else row["old_description"],
-                                        "new_value": row["new_hts"] if field == "hts" else row["new_description"],
+                                        "old_value": old_val, "new_value": new_val,
                                         "source_po": parse_result["po_number"], "resolution": "ignored",
                                     }])
                                     st.session_state.resolved[resolve_key] = "ignored"
                                     st.rerun()
 
-            if summary["hts_mismatch"] == 0 and summary["desc_mismatch"] == 0 and summary["new"] == 0:
+            if (summary["hts_mismatch"] == 0 and summary["desc_mismatch"] == 0
+                    and summary["tax_mismatch"] == 0 and summary["new"] == 0):
                 st.info("所有 SKU 均与 UK 数据库一致，无需处理。")
 
 # ---------------------------------------------------------------------------
