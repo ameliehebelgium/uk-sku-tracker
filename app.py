@@ -163,6 +163,7 @@ with tab_check:
             else:
                 master_df = load_sku_master()
                 file_results = {}
+                total_autofilled = 0
                 with st.spinner(f"正在解析并比对 {len(excel_files)} 个文件..."):
                     for fname, fobj in excel_files:
                         parse_result = parse_packing_list(fobj)
@@ -171,6 +172,24 @@ with tab_check:
                             comparison_df = compare_batch(
                                 parse_result["records"], master_df, fuzzy_threshold
                             )
+                            # 税率从空值补全为具体数值：品名、HTS 都没变，不是冲突，
+                            # 不需要人工逐条确认，这里直接写入数据库。只在"开始解析与比对"
+                            # 这次点击里跑一次，不会随其他按钮的页面刷新重复写入。
+                            autofill_df = comparison_df[comparison_df["status"] == "TAX_AUTOFILL"]
+                            if not autofill_df.empty:
+                                log_entries = []
+                                for _, row in autofill_df.iterrows():
+                                    update_sku_record(
+                                        row["sku"], row["new_description"], row["new_hts"],
+                                        parse_result["po_number"], new_tax_rate=row["new_tax_rate"],
+                                    )
+                                    log_entries.append({
+                                        "sku": row["sku"], "field_changed": "tax_rate",
+                                        "old_value": row["old_tax_rate"], "new_value": row["new_tax_rate"],
+                                        "source_po": parse_result["po_number"], "resolution": "auto_filled",
+                                    })
+                                append_change_log(log_entries)
+                                total_autofilled += len(autofill_df)
                         file_results[fname] = {
                             "parse_result": parse_result,
                             "comparison_df": comparison_df,
@@ -179,6 +198,8 @@ with tab_check:
                 st.session_state.file_results = file_results
                 st.session_state.resolved = {}
                 st.success(f"已解析 {len(excel_files)} 个文件。")
+                if total_autofilled > 0:
+                    st.success(f"✅ {total_autofilled} 个 SKU 的税率从空值自动补全为本次 PL 记录的数值，已直接写入 UK 数据库。")
 
     file_results = st.session_state.file_results
 
@@ -216,12 +237,13 @@ with tab_check:
             st.caption(f"来源 PO/箱单号：{parse_result['po_number'] or '未识别'}")
 
             summary = summarize_comparison(comparison_df)
-            c1, c2, c3, c4, c5 = st.columns(5)
+            c1, c2, c3, c4, c5, c6 = st.columns(6)
             c1.metric("总 SKU 数", summary["total"])
             c2.metric("✅ 一致", summary["match"])
             c3.metric("🔴 HTS 不一致", summary["hts_mismatch"])
             c4.metric("🟡 品名不一致", summary["desc_mismatch"])
             c5.metric("🔵 税率不一致", summary["tax_mismatch"])
+            c6.metric("🟢 税率自动补全", summary["tax_autofill"])
 
             new_df = comparison_df[comparison_df["status"] == "NEW"]
             if not new_df.empty:
@@ -322,7 +344,8 @@ with tab_check:
                                     st.rerun()
 
             if (summary["hts_mismatch"] == 0 and summary["desc_mismatch"] == 0
-                    and summary["tax_mismatch"] == 0 and summary["new"] == 0):
+                    and summary["tax_mismatch"] == 0 and summary["new"] == 0
+                    and summary["tax_autofill"] == 0):
                 st.info("所有 SKU 均与 UK 数据库一致，无需处理。")
 
 # ---------------------------------------------------------------------------
