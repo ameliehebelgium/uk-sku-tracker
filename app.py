@@ -105,6 +105,20 @@ def _df_to_excel_bytes(df: pd.DataFrame, sheet_name: str = "Sheet1") -> bytes:
     return buffer.getvalue()
 
 
+def _tax_proposed_change(row) -> bool:
+    """
+    本次 PL 记录的税率是否跟数据库原值不一样（用于判断 HTS/品名不一致的卡片
+    要不要额外弹出"税率单独确认"的选项）。
+
+    compare_engine 里 new_tax_rate 已经处理过"本次没读到税率就退回用原值"的
+    情况（effective_new_tax_rate），所以这里只需要简单比较字符串——如果本次
+    没有新税率，new_tax_rate 早就等于 old_tax_rate 了，不会误触发。
+    """
+    new_val = str(row.get("new_tax_rate") or "").strip()
+    old_val = str(row.get("old_tax_rate") or "").strip()
+    return new_val != "" and new_val != old_val
+
+
 def _combined_comparison_df(file_results: dict) -> pd.DataFrame:
     """把本次上传的所有文件的比对结果合并成一个 DataFrame，加一列标注来源文件。"""
     frames = []
@@ -300,12 +314,43 @@ with tab_check:
                         if already_resolved:
                             st.info(f"已处理：{'已更新数据库' if already_resolved == 'updated' else '已忽略，保留原记录'}")
                         else:
+                            # HTS/品名不一致的同时，本次 PL 读到的税率如果跟数据库原值也不一样，
+                            # 这是两件独立的事——HTS/品名的差异可能是真实变更，但同一份 PL 上
+                            # 的税率完全可能是数据源本身的错误（跟 HTS/品名是否可信没有必然关系）。
+                            # 所以这里单独给一个税率处理方式的选项，不强制跟 HTS/品名绑在一起。
+                            # 默认选中"采用新税率"，跟以前的行为保持一致，用户判断这次税率不可信
+                            # 时可以手动切换成"保留原税率"，两者互不影响地一起点击下面的确认按钮。
+                            show_tax_choice = (
+                                row["status"] in ("HTS_MISMATCH", "DESC_MISMATCH")
+                                and _tax_proposed_change(row)
+                            )
+                            tax_accepted = True
+                            if show_tax_choice:
+                                st.caption(
+                                    f"⚠️ 本次 PL 记录的税率（{row['new_tax_rate']}）与数据库原值"
+                                    f"（{row['old_tax_rate'] or '（空）'}）也不一样，这跟上面的"
+                                    f"{'HTS' if row['status'] == 'HTS_MISMATCH' else '品名'}差异是两件独立的事，"
+                                    f"请单独确认税率是否可信："
+                                )
+                                tax_decision = st.radio(
+                                    "税率处理方式",
+                                    options=[
+                                        f"采用本次 PL 的新税率（{row['new_tax_rate']}）",
+                                        f"保留数据库原税率（{row['old_tax_rate'] or '（空）'}）",
+                                    ],
+                                    key=f"taxchoice_{fname}_{sku}",
+                                    horizontal=True,
+                                    label_visibility="collapsed",
+                                )
+                                tax_accepted = tax_decision.startswith("采用本次")
+
                             btn_col1, btn_col2 = st.columns(2)
                             with btn_col1:
                                 if st.button("✅ 用新值更新数据库", key=f"update_{fname}_{sku}"):
+                                    effective_tax_rate = row["new_tax_rate"] if tax_accepted else row["old_tax_rate"]
                                     update_sku_record(
                                         sku, row["new_description"], row["new_hts"],
-                                        parse_result["po_number"], new_tax_rate=row["new_tax_rate"],
+                                        parse_result["po_number"], new_tax_rate=effective_tax_rate,
                                     )
                                     log_entries = []
                                     if row["status"] == "HTS_MISMATCH":
@@ -320,10 +365,19 @@ with tab_check:
                                             "old_value": row["old_description"], "new_value": row["new_description"],
                                             "source_po": parse_result["po_number"], "resolution": "updated",
                                         })
-                                    if row["new_tax_rate"] != row["old_tax_rate"]:
+                                    if show_tax_choice and not tax_accepted:
+                                        # 税率被单独拒绝了：记下"本次 PL 提出过这个税率，但被人工
+                                        # 判定不可信、没有采纳"，保留完整审计轨迹，跟 HTS/品名的
+                                        # "updated" 结果分开记录。
                                         log_entries.append({
                                             "sku": sku, "field_changed": "tax_rate",
                                             "old_value": row["old_tax_rate"], "new_value": row["new_tax_rate"],
+                                            "source_po": parse_result["po_number"], "resolution": "rejected_kept_old",
+                                        })
+                                    elif effective_tax_rate != row["old_tax_rate"]:
+                                        log_entries.append({
+                                            "sku": sku, "field_changed": "tax_rate",
+                                            "old_value": row["old_tax_rate"], "new_value": effective_tax_rate,
                                             "source_po": parse_result["po_number"], "resolution": "updated",
                                         })
                                     append_change_log(log_entries)

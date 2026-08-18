@@ -37,6 +37,14 @@ COLUMN_KEYWORDS = {
 # 自动侦测税率列时，一列里"看起来像税率"（0~100 的数字）的行占比至少要达到这个比例
 TAX_RATE_DETECT_MIN_RATIO = 0.6
 
+# 自动侦测税率列时，候选列"不重复值占比"（_distinct_value_ratio）不能超过这个上限。
+# 税率本质上是按 HTS 分类挂钩的，取值范围很有限，同一批货里会大量重复；
+# 而"每个 SKU 的件数/箱数"这类数量型列，虽然数值也常常落在 0~100 区间、
+# 会通过"看起来像税率"的检测，但重复率明显更低（每个 SKU 数量都不太一样）。
+# 用已确认的真实样本校准：真正的税率列 distinct_ratio 落在 0.2~0.5 之间，
+# 而误判案例（件数列）是 0.75，取 0.6 作为分界，两边都留出安全余量。
+TAX_RATE_MAX_DISTINCT_RATIO = 0.6
+
 # 多 sheet 文件（例如「发票/箱单/合同」三表合一）中，用于识别「箱单」这个 sheet 的关键词
 PACKING_LIST_SHEET_HINTS = ["箱单", "装箱单", "packing list", "packing-list", "packinglist"]
 
@@ -173,9 +181,14 @@ def _locate_tax_rate_column(raw: pd.DataFrame, header_idx: int, sku_col_idx: int
     这么做的原因：这类模板里 SKU 列右边常常同时有好几列数值——「本 SKU 数量」
     「单件重量」「税率」「税额/税金」等，其中不少也恰好落在 0~100 区间、
     会被误判成"像税率"。真正的税率本质上是按 HTS 分类挂钩的，取值范围很
-    有限，同一批货的不同 SKU 之间会大量重复；而"税额/税金"是数量×单价×
-    税率算出来的连续型金额，几乎每行都不一样。所以取重复率最高（不重复值
-    占比最低）的候选列，比单纯"取最靠右一列"更可靠。
+    有限，同一批货的不同 SKU 之间会大量重复；而"税额/税金""每 SKU 件数/箱数"
+    这些是数量×单价×税率算出来的连续型金额或逐件计数，几乎每行都不一样。
+    所以取重复率最高（不重复值占比最低）的候选列，比单纯"取最靠右一列"更
+    可靠；而且额外要求这个占比不能超过 TAX_RATE_MAX_DISTINCT_RATIO —— 如果
+    连重复率最高的候选列都达不到"像税率"该有的重复程度，说明这份文件里
+    很可能根本没有真正的税率列（很可能是件数/箱数这类列恰好数值也落在
+    0~100 区间，被误当成候选），这种情况下宁可整列留空、提示"未找到税率
+    列"，也不要把明显不像税率的数据错误地当成税率写进数据库。
     都找不到候选列时返回 None（调用方留空，不报警）。
     """
     data_rows = raw.iloc[header_idx + 1:]
@@ -189,6 +202,10 @@ def _locate_tax_rate_column(raw: pd.DataFrame, header_idx: int, sku_col_idx: int
         if not _column_looks_like_tax_rate(col):
             continue
         candidates.append((_distinct_value_ratio(col), col_idx))
+
+    # 只保留"重复率"达标的候选（占比不超过上限），排除掉像件数/箱数这种
+    # 虽然落在 0~100 区间、但每行都不太一样的列。
+    candidates = [c for c in candidates if c[0] <= TAX_RATE_MAX_DISTINCT_RATIO]
 
     if not candidates:
         return None
