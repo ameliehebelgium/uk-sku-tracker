@@ -13,6 +13,7 @@ Google Sheets 数据库连接层 —— 英国 (UK) 进口数据专属
 均可复用，只需确保该 service account 被共享到这个新建的 UK Spreadsheet）。
 """
 
+import time
 import gspread
 import pandas as pd
 import streamlit as st
@@ -39,6 +40,36 @@ CHANGE_LOG_HEADERS = [
     "source_po", "resolution",  # resolution: "updated" / "ignored" / "pending"
 ]
 
+# 429（配额超限）、500/503（Google 那边偶发的服务端错误）都是"过一会儿再试
+# 大概率能成功"的临时性错误，值得重试；其他错误（比如权限不对、表不存在）
+# 重试也没用，直接抛出交给上层处理。
+_RETRYABLE_STATUS_CODES = {429, 500, 503}
+_RETRY_MAX_ATTEMPTS = 5
+_RETRY_BASE_DELAY_SECONDS = 1.5
+
+
+def _call_with_retry(func, *args, **kwargs):
+    """
+    包一层重试 + 指数退避，用来发实际的 Google Sheets API 请求。
+
+    背景：这套 App 在测试/使用高峰期，短时间内会有好几个动作都要读写
+    Google Sheets（打开表、读主数据库、写变更日志……），很容易撞上 Google
+    "每分钟/每100秒请求数"的配额上限，报 429 APIError 直接把整个页面搞崩。
+    大多数情况下配额是按滚动窗口算的，等个一两秒重试一次基本就能通过，
+    不需要真的让用户看到一个红色报错框。
+    """
+    last_err = None
+    for attempt in range(_RETRY_MAX_ATTEMPTS):
+        try:
+            return func(*args, **kwargs)
+        except gspread.exceptions.APIError as e:
+            status = getattr(e, "code", None)
+            if status not in _RETRYABLE_STATUS_CODES or attempt == _RETRY_MAX_ATTEMPTS - 1:
+                raise
+            last_err = e
+            time.sleep(_RETRY_BASE_DELAY_SECONDS * (2 ** attempt))
+    raise last_err
+
 
 @st.cache_resource
 def _get_client():
@@ -60,20 +91,20 @@ def _get_spreadsheet():
     """
     client = _get_client()
     sheet_id = st.secrets["UK_SHEET_ID"]
-    return client.open_by_key(sheet_id)
+    return _call_with_retry(client.open_by_key, sheet_id)
 
 
 def _get_or_create_worksheet(spreadsheet, title: str, headers: list):
     try:
-        ws = spreadsheet.worksheet(title)
+        ws = _call_with_retry(spreadsheet.worksheet, title)
     except gspread.exceptions.WorksheetNotFound:
-        ws = spreadsheet.add_worksheet(title=title, rows=1000, cols=len(headers) + 2)
-        ws.append_row(headers)
+        ws = _call_with_retry(spreadsheet.add_worksheet, title=title, rows=1000, cols=len(headers) + 2)
+        _call_with_retry(ws.append_row, headers)
         return ws
 
-    existing_values = ws.row_values(1)
+    existing_values = _call_with_retry(ws.row_values, 1)
     if not existing_values:
-        ws.append_row(headers)
+        _call_with_retry(ws.append_row, headers)
     return ws
 
 
@@ -87,7 +118,7 @@ def load_sku_master() -> pd.DataFrame:
     """
     spreadsheet = _get_spreadsheet()
     ws = _get_or_create_worksheet(spreadsheet, SKU_MASTER_SHEET_NAME, SKU_MASTER_HEADERS)
-    records = ws.get_all_records()
+    records = _call_with_retry(ws.get_all_records)
     if not records:
         return pd.DataFrame(columns=SKU_MASTER_HEADERS)
 
@@ -105,7 +136,7 @@ def load_change_log() -> pd.DataFrame:
     """同样缓存 30 秒，理由跟 load_sku_master 一样：避免每次脚本重跑都重新读表触发 429。"""
     spreadsheet = _get_spreadsheet()
     ws = _get_or_create_worksheet(spreadsheet, CHANGE_LOG_SHEET_NAME, CHANGE_LOG_HEADERS)
-    records = ws.get_all_records()
+    records = _call_with_retry(ws.get_all_records)
     if not records:
         return pd.DataFrame(columns=CHANGE_LOG_HEADERS)
     return pd.DataFrame(records)
@@ -128,7 +159,7 @@ def append_new_skus(new_skus: pd.DataFrame, source_po: str):
             today, today, source_po or "",
         ])
 
-    ws.append_rows(rows, value_input_option="USER_ENTERED")
+    _call_with_retry(ws.append_rows, rows, value_input_option="USER_ENTERED")
     load_sku_master.clear()
 
 
@@ -145,7 +176,7 @@ def update_sku_record(sku: str, new_description: str, new_hts: str, source_po: s
     spreadsheet = _get_spreadsheet()
     ws = _get_or_create_worksheet(spreadsheet, SKU_MASTER_SHEET_NAME, SKU_MASTER_HEADERS)
 
-    all_values = ws.get_all_values()
+    all_values = _call_with_retry(ws.get_all_values)
     headers = all_values[0]
     sku_col_idx = headers.index("sku")
     desc_col_idx = headers.index("description")
@@ -157,11 +188,18 @@ def update_sku_record(sku: str, new_description: str, new_hts: str, source_po: s
 
     for row_idx, row in enumerate(all_values[1:], start=2):
         if len(row) > sku_col_idx and row[sku_col_idx].strip() == sku.strip():
-            ws.update_cell(row_idx, desc_col_idx + 1, new_description)
-            ws.update_cell(row_idx, hts_col_idx + 1, new_hts)
+            # 这几个单元格改动合并成一次 batch_update，而不是 4 次单独的
+            # update_cell 调用——减少请求数，也降低撞上配额限制的概率。
+            cell_updates = [
+                {"range": gspread.utils.rowcol_to_a1(row_idx, desc_col_idx + 1), "values": [[new_description]]},
+                {"range": gspread.utils.rowcol_to_a1(row_idx, hts_col_idx + 1), "values": [[new_hts]]},
+                {"range": gspread.utils.rowcol_to_a1(row_idx, last_updated_idx + 1), "values": [[today]]},
+            ]
             if new_tax_rate and tax_col_idx is not None:
-                ws.update_cell(row_idx, tax_col_idx + 1, new_tax_rate)
-            ws.update_cell(row_idx, last_updated_idx + 1, today)
+                cell_updates.append(
+                    {"range": gspread.utils.rowcol_to_a1(row_idx, tax_col_idx + 1), "values": [[new_tax_rate]]}
+                )
+            _call_with_retry(ws.batch_update, cell_updates, value_input_option="USER_ENTERED")
             load_sku_master.clear()
             return True
     return False
@@ -190,7 +228,7 @@ def bulk_update_tax_rates(updates: list[dict]) -> int:
     spreadsheet = _get_spreadsheet()
     ws = _get_or_create_worksheet(spreadsheet, SKU_MASTER_SHEET_NAME, SKU_MASTER_HEADERS)
 
-    all_values = ws.get_all_values()
+    all_values = _call_with_retry(ws.get_all_values)
     if not all_values:
         return 0
     headers = all_values[0]
@@ -224,7 +262,7 @@ def bulk_update_tax_rates(updates: list[dict]) -> int:
         updated_count += 1
 
     if batch_data:
-        ws.batch_update(batch_data, value_input_option="USER_ENTERED")
+        _call_with_retry(ws.batch_update, batch_data, value_input_option="USER_ENTERED")
         load_sku_master.clear()
 
     return updated_count
@@ -246,5 +284,5 @@ def append_change_log(entries: list[dict]):
             e["new_value"], e.get("source_po", ""), e.get("resolution", "pending"),
         ])
 
-    ws.append_rows(rows, value_input_option="USER_ENTERED")
+    _call_with_retry(ws.append_rows, rows, value_input_option="USER_ENTERED")
     load_change_log.clear()
