@@ -13,6 +13,7 @@ Google Sheets 数据库连接层 —— 英国 (UK) 进口数据专属
 均可复用，只需确保该 service account 被共享到这个新建的 UK Spreadsheet）。
 """
 
+import re
 import time
 import gspread
 import pandas as pd
@@ -97,6 +98,110 @@ def _get_spreadsheet():
     return _call_with_retry(client.open_by_key, sheet_id)
 
 
+# ---------------------------------------------------------------------------
+# UK_SKU_Master 表头/数据错位问题：自动检测 + 自动修复
+#
+# 背景（一次真实发生过的事故）：UK_SKU_Master 的表头行是在"税率"字段还没
+# 加入 SKU_MASTER_HEADERS 之前就建好的（旧顺序：sku, description, hts,
+# first_seen_date, last_updated_date, source_po），后来代码把 tax_rate 插入
+# 成第 4 个字段，但表头行从来没有跟着更新过（_get_or_create_worksheet 原来
+# 的逻辑只在"整行完全空白"时才会写表头，已存在的表头不会被自动纠正）。
+# 结果是写入代码一直按新顺序物理写数据（税率在第 4 列），表头却还是旧顺序，
+# 导致用表头名字读数据时 first_seen_date / last_updated_date / source_po
+# 全部读错列，税率永远读成空的——而且是静默发生的，直到导出全库看 Excel
+# 才发现，此时已经有 1000+ 行数据是这个错位状态。
+#
+# 下面这组函数在每次"找表"时顺手检查一下表头是否跟代码一致；如果发现是
+# UK_SKU_Master 这张表、而且错位的行都能被规则明确识别（不是什么诡异的
+# 未知格式），就自动把数据搬回正确的物理列位置、顺手把表头也改对，全程
+# 不需要人工介入、不需要额外跑脚本、不需要把 Google 凭据交出去——反正
+# 部署在 Streamlit Cloud 上的这个 App 本来就有权限读写这张表。
+# 只有遇到规则识别不了的行时才会放弃自动修复，转而报错停止，避免在没把握
+# 的情况下瞎改数据；这种情况下可以用 migrate_uk_sku_master.py 手动排查。
+# ---------------------------------------------------------------------------
+_SKU_MASTER_DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+_SKU_MASTER_PO_RE = re.compile(r"^[A-Za-z]{2,}-")
+
+
+def _classify_legacy_sku_master_row(row: list) -> str:
+    """
+    判断 UK_SKU_Master 里一行数据当前是"新物理布局"（已经跟 SKU_MASTER_HEADERS
+    一致，不用动）还是"旧物理布局"（税率功能上线前写入的，D/E 是日期、F 是
+    来源 PO、G/H 为空，需要整体右移一列）。跟 migrate_uk_sku_master.py 里的
+    判定规则保持一致。
+    """
+    g = (row[6] if len(row) > 6 else "").strip()
+    if g:
+        return "new"
+    d = (row[3] if len(row) > 3 else "").strip()
+    e = (row[4] if len(row) > 4 else "").strip()
+    f = (row[5] if len(row) > 5 else "").strip()
+    if _SKU_MASTER_DATE_RE.match(d) and _SKU_MASTER_DATE_RE.match(e) and _SKU_MASTER_PO_RE.match(f):
+        return "old"
+    if not d and not e and not f:
+        return "unknown"
+    return "unknown"
+
+
+def _try_auto_migrate_sku_master(ws) -> bool:
+    """
+    尝试自动修复 UK_SKU_Master 的表头/数据错位问题。
+
+    Returns:
+        True  - 已经成功修复（或者扫描后发现其实不需要修复），调用方可以放心继续。
+        False - 遇到了规则识别不了的行，没有安全地自动修复，调用方应该转去
+                走"报错并停止"的逻辑，提示人工用 migrate_uk_sku_master.py 处理。
+    """
+    all_values = _call_with_retry(ws.get_all_values)
+    if not all_values:
+        return False
+    data_rows = all_values[1:]
+
+    old_rows = []
+    for idx, row in enumerate(data_rows, start=2):
+        padded = row + [""] * max(0, 8 - len(row))
+        kind = _classify_legacy_sku_master_row(padded)
+        if kind == "unknown":
+            return False
+        if kind == "old":
+            old_rows.append((idx, padded))
+
+    batch_data = []
+    for idx, row in old_rows:
+        d, e, f = row[3], row[4], row[5]
+        # D(税率)清空、E<-原D(首次入库日期)、F<-原E(最后更新日期)、G<-原F(来源PO)
+        batch_data.append({"range": f"D{idx}:G{idx}", "values": [["", d, e, f]]})
+    # 表头统一成跟 SKU_MASTER_HEADERS 一致的 7 列，并清空多余的第 8 列
+    # （旧表头里被误放在第 8 列的"税率"文字）
+    batch_data.append({"range": "A1:H1", "values": [SKU_MASTER_HEADERS + [""]]})
+
+    _call_with_retry(ws.batch_update, batch_data, value_input_option="USER_ENTERED")
+
+    if old_rows:
+        st.info(
+            f"ℹ️ 检测到 UK_SKU_Master 的表头与代码字段顺序不一致（历史遗留问题：'税率'"
+            f"功能上线时表头没有同步更新过），已自动修复：迁移了 {len(old_rows)} 行旧格式"
+            f"数据、并更正了表头顺序。这条提示只会在修复当次出现，之后不会再提示。"
+        )
+    return True
+
+
+def _fail_on_header_mismatch(actual_headers: list, expected_headers: list, sheet_title: str):
+    """
+    表头跟代码定义的顺序对不上、又没能自动修复时，与其让程序继续往错误的列
+    写数据，不如在这里就停下来，把问题摆在明处。
+    """
+    st.error(
+        f"⚠️ 「{sheet_title}」这张表的表头（第 1 行）跟代码里定义的字段顺序不一致，"
+        f"为了避免继续往错误的列写入数据，程序已经停止运行。\n\n"
+        f"代码期望的顺序：{expected_headers}\n\n"
+        f"表里实际的顺序：{actual_headers}\n\n"
+        f"请参考 migrate_uk_sku_master.py 里的说明手动排查、迁移数据，"
+        f"或者手动把 Google Sheet 里这一行改回代码期望的顺序。"
+    )
+    st.stop()
+
+
 def _get_or_create_worksheet(spreadsheet, title: str, headers: list):
     try:
         ws = _call_with_retry(spreadsheet.worksheet, title)
@@ -108,6 +213,12 @@ def _get_or_create_worksheet(spreadsheet, title: str, headers: list):
     existing_values = _call_with_retry(ws.row_values, 1)
     if not existing_values:
         _call_with_retry(ws.append_row, headers)
+        return ws
+
+    if existing_values[: len(headers)] != headers:
+        if title == SKU_MASTER_SHEET_NAME and _try_auto_migrate_sku_master(ws):
+            return ws
+        _fail_on_header_mismatch(existing_values, headers, title)
     return ws
 
 
