@@ -101,6 +101,25 @@ def _extract_excel_files(uploaded_files):
     return excel_files, notes
 
 
+def _group_by_description(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    把主数据库按品名分组排列：同一个品名（忽略大小写、首尾空格差异，比如
+    "RETRACTABLE HOSE REEL" 和 "retractable hose reel" 算同一组）的 SKU
+    排在一起，方便人工浏览/核对同一产品下有哪些 SKU。组内再按 SKU 排序，
+    保证每次导出顺序都是确定的（不会因为原始行顺序不同而每次导出都不一样）。
+
+    只用于"导出"这个动作，不改变 master_df 本身、也不影响 Google Sheet 里
+    的实际行顺序——数据库里的写入逻辑（新增/更新 SKU）都是按 SKU 名字定位
+    行的，跟物理顺序无关，所以只在生成下载文件之前做一次排序是安全的。
+    """
+    if df.empty or "description" not in df.columns:
+        return df
+    sort_key = df["description"].fillna("").astype(str).str.strip().str.upper()
+    return df.assign(_sort_key=sort_key).sort_values(
+        by=["_sort_key", "sku"], kind="stable"
+    ).drop(columns="_sort_key").reset_index(drop=True)
+
+
 def _df_to_excel_bytes(df: pd.DataFrame, sheet_name: str = "Sheet1") -> bytes:
     """
     把 DataFrame 转成 xlsx 文件的字节内容，用于 App 里各处的"下载"按钮。
@@ -460,7 +479,7 @@ with tab_database:
         st.write("")
         st.download_button(
             "⬇️ 导出全部主数据库",
-            data=_df_to_excel_bytes(master_df, sheet_name="UK_SKU_Master"),
+            data=_df_to_excel_bytes(_group_by_description(master_df), sheet_name="UK_SKU_Master"),
             file_name="UK_SKU_Master_全库导出.xlsx",
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         )
