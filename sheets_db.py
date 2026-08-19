@@ -222,47 +222,6 @@ def _get_or_create_worksheet(spreadsheet, title: str, headers: list):
     return ws
 
 
-def _apply_sku_master_display_formatting(ws):
-    """
-    给 UK_SKU_Master 做一次性的显示效果优化：冻结表头行、把列宽调整到能完整
-    显示每列的内容、给有数据的区域整体加上边框。纯视觉/排版调整，不改变
-    任何数据本身，多次重复执行也是安全的（幂等）。
-
-    只在 _get_sku_master_worksheet() 第一次拿到 worksheet 句柄时调用一次
-    （靠 st.cache_resource 保证整个 App 进程生命周期里只跑一次），不会因为
-    用户点按钮触发的页面重跑而反复执行、消耗额外配额。代价是：这次格式化
-    之后新增的行，要等下一次 App 进程重启（重新部署、或 Streamlit Cloud
-    休眠后被唤醒）才会被納入边框范围——对纯展示效果来说这个延迟可以接受。
-    """
-    all_values = _call_with_retry(ws.get_all_values)
-    data_row_count = max(0, len(all_values) - 1)
-    if data_row_count == 0:
-        return
-
-    last_row = data_row_count + 1  # +1 是表头行
-    last_col_letter = gspread.utils.rowcol_to_a1(1, len(SKU_MASTER_HEADERS)).rstrip("0123456789")
-    data_range = f"A1:{last_col_letter}{last_row}"
-
-    # 冻结表头行，往下滚动的时候表头始终可见
-    _call_with_retry(ws.freeze, rows=1)
-    # 把每一列的宽度调整到刚好能完整显示该列最长的内容（Google Sheets 的
-    # "调整到符合数据大小"），避免内容被相邻列挡住只显示一半
-    _call_with_retry(ws.columns_auto_resize, 0, len(SKU_MASTER_HEADERS))
-    # 给整个有数据的区域（表头 + 所有数据行）加上四周边框
-    _call_with_retry(
-        ws.format,
-        data_range,
-        {
-            "borders": {
-                "top": {"style": "SOLID"},
-                "bottom": {"style": "SOLID"},
-                "left": {"style": "SOLID"},
-                "right": {"style": "SOLID"},
-            }
-        },
-    )
-
-
 @st.cache_resource
 def _get_sku_master_worksheet():
     """
@@ -276,13 +235,62 @@ def _get_sku_master_worksheet():
     实测中真实报错的原因：APIError 429, Read requests per minute per user）。
     worksheet 的身份基本不会变，缓存成 cache_resource（跟应用进程同生命周期），
     这个查找动作整个部署周期只会真正发生一次。
-
-    顺便在这里（同样只会执行一次）做一次显示效果优化——冻结表头、列宽自适应、
-    加边框，详见 _apply_sku_master_display_formatting。
     """
-    ws = _get_or_create_worksheet(_get_spreadsheet(), SKU_MASTER_SHEET_NAME, SKU_MASTER_HEADERS)
-    _apply_sku_master_display_formatting(ws)
-    return ws
+    return _get_or_create_worksheet(_get_spreadsheet(), SKU_MASTER_SHEET_NAME, SKU_MASTER_HEADERS)
+
+
+def format_sku_master_sheet() -> dict:
+    """
+    给 UK_SKU_Master 做一次显示效果优化：冻结表头行、把列宽调整到能完整显示
+    每列的内容、给有数据的区域整体加上边框。纯视觉/排版调整，不改变任何
+    数据本身，可以随时重复调用（幂等，不会因为重复执行而堆积/出错）。
+
+    设计成一个可以被 App 里的按钮直接调用的公开函数（而不是像之前那版一样
+    藏在 _get_sku_master_worksheet 里"只在 worksheet 句柄第一次被创建时自动
+    跑一次"）——那种写法的问题是：它到底有没有真的执行成功，用户在页面上
+    完全看不出来（st.cache_resource 是跨 session 共享的，那次唯一的执行可能
+    发生在任何一个用户的请求里，触发它的人也不一定会看到过程中的提示，而且
+    st.cache_resource 命中缓存后就再也不会重新执行）。改成手动按钮触发之后，
+    每次点击都能立刻看到明确的成功/失败反馈，出问题也能马上定位是哪一步、
+    什么错误，而不是"看起来没生效但不知道为什么"。
+
+    Returns:
+        成功：{"success": True, "rows_formatted": N, "range": "A1:G123" 或 None（空表）}
+        失败：{"success": False, "error": "具体的错误信息"}
+        不会向外抛异常——调用方（按钮点击）直接把返回结果展示给用户即可。
+    """
+    try:
+        ws = _get_sku_master_worksheet()
+        all_values = _call_with_retry(ws.get_all_values)
+        data_row_count = max(0, len(all_values) - 1)
+        if data_row_count == 0:
+            return {"success": True, "rows_formatted": 0, "range": None}
+
+        last_row = data_row_count + 1  # +1 是表头行
+        last_col_letter = gspread.utils.rowcol_to_a1(1, len(SKU_MASTER_HEADERS)).rstrip("0123456789")
+        data_range = f"A1:{last_col_letter}{last_row}"
+
+        # 冻结表头行，往下滚动的时候表头始终可见
+        _call_with_retry(ws.freeze, rows=1)
+        # 把每一列的宽度调整到刚好能完整显示该列最长的内容（Google Sheets 的
+        # "调整到符合数据大小"），避免内容被相邻列挡住只显示一半
+        _call_with_retry(ws.columns_auto_resize, 0, len(SKU_MASTER_HEADERS))
+        # 给整个有数据的区域（表头 + 所有数据行）加上四周边框；显式指定
+        # width/color，避免只写 style 在某些情况下渲染不出可见边框线
+        border_side = {"style": "SOLID", "width": 1, "color": {"red": 0, "green": 0, "blue": 0}}
+        _call_with_retry(
+            ws.format,
+            data_range,
+            {
+                "borders": {
+                    "top": border_side, "bottom": border_side,
+                    "left": border_side, "right": border_side,
+                }
+            },
+        )
+        return {"success": True, "rows_formatted": data_row_count, "range": data_range}
+    except Exception as e:
+        return {"success": False, "error": f"{type(e).__name__}: {e}"}
 
 
 @st.cache_resource

@@ -19,6 +19,7 @@ from compare_engine import compare_batch, summarize_comparison, DEFAULT_FUZZY_TH
 from sheets_db import (
     load_sku_master, load_change_log,
     append_new_skus, update_sku_record, append_change_log, bulk_update_tax_rates,
+    format_sku_master_sheet,
 )
 
 st.set_page_config(page_title="UK SKU 比对预警系统", page_icon="🇬🇧", layout="wide")
@@ -431,6 +432,26 @@ with tab_database:
         )
         display_df = master_df[mask]
     st.caption(f"共 {len(master_df)} 条记录，当前显示 {len(display_df)} 条")
+
+    # 手动触发一次 Google Sheet 显示效果优化（冻结表头/列宽自适应/加边框）。
+    # 做成按钮而不是让它在后台自动跑一次的原因：自动跑的话用户完全看不出来
+    # 到底有没有真的执行成功；点按钮能立刻拿到明确的成功/失败反馈，新增的
+    # SKU 超出了上次加边框的范围时，也可以随时手动再点一次覆盖到最新范围。
+    if st.button("🎨 整理 Google Sheet 格式（冻结表头 / 列宽自适应 / 加边框）"):
+        with st.spinner("正在整理格式..."):
+            result = format_sku_master_sheet()
+        if result["success"]:
+            if result["rows_formatted"] == 0:
+                st.info("UK_SKU_Master 目前没有数据，无需整理格式。")
+            else:
+                st.success(
+                    f"✅ 格式整理完成：已冻结表头行、调整了 {len(master_df.columns)} 列的列宽、"
+                    f"给 {result['range']} 这个范围（{result['rows_formatted']} 行数据）加上了边框。"
+                    f"去 Google Sheet 里刷新看一下效果。"
+                )
+        else:
+            st.error(f"格式整理失败：{result['error']}")
+
     st.dataframe(display_df, width='stretch', hide_index=True)
 
 # ---------------------------------------------------------------------------
