@@ -13,6 +13,8 @@ import zipfile
 
 import streamlit as st
 import pandas as pd
+from openpyxl.styles import Border, Side
+from openpyxl.utils import get_column_letter
 
 from pl_parser import parse_packing_list
 from compare_engine import compare_batch, summarize_comparison, DEFAULT_FUZZY_THRESHOLD
@@ -100,9 +102,48 @@ def _extract_excel_files(uploaded_files):
 
 
 def _df_to_excel_bytes(df: pd.DataFrame, sheet_name: str = "Sheet1") -> bytes:
+    """
+    把 DataFrame 转成 xlsx 文件的字节内容，用于 App 里各处的"下载"按钮。
+
+    这个函数生成的是一份全新的、独立的 xlsx（用 pandas/openpyxl 从原始数值
+    重新画出来的），跟 Google Sheet 本身的格式设置没有任何关系——就算
+    UK_SKU_Master 这张 Google Sheet 已经冻结了表头、调好了列宽、加了边框，
+    这里导出的文件也不会自动带上这些效果，因为它压根不是从 Google Sheet
+    直接导出的，只是拿同样的数据重新生成了一份干净的表格。
+
+    所以这里顺手也做一次同样的显示效果优化——冻结表头行、列宽自适应到能
+    完整显示内容、给有数据的区域加边框——让下载下来的文件看起来跟线上
+    Google Sheet 一致，不会再出现"网页上好好的，下载下来却很难看"的落差。
+    """
     buffer = io.BytesIO()
     with pd.ExcelWriter(buffer, engine="openpyxl") as writer:
         df.to_excel(writer, index=False, sheet_name=sheet_name)
+        ws = writer.sheets[sheet_name]
+
+        if not df.empty:
+            # 冻结表头行，往下滚动的时候表头始终可见
+            ws.freeze_panes = "A2"
+
+            # 列宽自适应：按该列表头文字 + 所有单元格内容里最长的字符串长度
+            # 来定宽（openpyxl 没有 Google Sheets 那种"按实际渲染像素自动
+            # 适配"的功能，这里用字符数估算，额外留 2 个字符的余量，实际
+            # 效果已经足够避免内容被截断；封顶 60，避免个别很长的品名
+            # 把整列撑得离谱）。
+            for col_idx, col_name in enumerate(df.columns, start=1):
+                col_letter = get_column_letter(col_idx)
+                max_len = len(str(col_name))
+                for val in df[col_name]:
+                    if pd.notna(val):
+                        max_len = max(max_len, len(str(val)))
+                ws.column_dimensions[col_letter].width = min(max_len + 2, 60)
+
+            # 给表头 + 所有数据行加上四周边框
+            thin_side = Side(style="thin", color="000000")
+            border = Border(left=thin_side, right=thin_side, top=thin_side, bottom=thin_side)
+            for row in ws.iter_rows(min_row=1, max_row=len(df) + 1, min_col=1, max_col=len(df.columns)):
+                for cell in row:
+                    cell.border = border
+
     return buffer.getvalue()
 
 
