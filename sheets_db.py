@@ -222,6 +222,47 @@ def _get_or_create_worksheet(spreadsheet, title: str, headers: list):
     return ws
 
 
+def _apply_sku_master_display_formatting(ws):
+    """
+    给 UK_SKU_Master 做一次性的显示效果优化：冻结表头行、把列宽调整到能完整
+    显示每列的内容、给有数据的区域整体加上边框。纯视觉/排版调整，不改变
+    任何数据本身，多次重复执行也是安全的（幂等）。
+
+    只在 _get_sku_master_worksheet() 第一次拿到 worksheet 句柄时调用一次
+    （靠 st.cache_resource 保证整个 App 进程生命周期里只跑一次），不会因为
+    用户点按钮触发的页面重跑而反复执行、消耗额外配额。代价是：这次格式化
+    之后新增的行，要等下一次 App 进程重启（重新部署、或 Streamlit Cloud
+    休眠后被唤醒）才会被納入边框范围——对纯展示效果来说这个延迟可以接受。
+    """
+    all_values = _call_with_retry(ws.get_all_values)
+    data_row_count = max(0, len(all_values) - 1)
+    if data_row_count == 0:
+        return
+
+    last_row = data_row_count + 1  # +1 是表头行
+    last_col_letter = gspread.utils.rowcol_to_a1(1, len(SKU_MASTER_HEADERS)).rstrip("0123456789")
+    data_range = f"A1:{last_col_letter}{last_row}"
+
+    # 冻结表头行，往下滚动的时候表头始终可见
+    _call_with_retry(ws.freeze, rows=1)
+    # 把每一列的宽度调整到刚好能完整显示该列最长的内容（Google Sheets 的
+    # "调整到符合数据大小"），避免内容被相邻列挡住只显示一半
+    _call_with_retry(ws.columns_auto_resize, 0, len(SKU_MASTER_HEADERS))
+    # 给整个有数据的区域（表头 + 所有数据行）加上四周边框
+    _call_with_retry(
+        ws.format,
+        data_range,
+        {
+            "borders": {
+                "top": {"style": "SOLID"},
+                "bottom": {"style": "SOLID"},
+                "left": {"style": "SOLID"},
+                "right": {"style": "SOLID"},
+            }
+        },
+    )
+
+
 @st.cache_resource
 def _get_sku_master_worksheet():
     """
@@ -235,8 +276,13 @@ def _get_sku_master_worksheet():
     实测中真实报错的原因：APIError 429, Read requests per minute per user）。
     worksheet 的身份基本不会变，缓存成 cache_resource（跟应用进程同生命周期），
     这个查找动作整个部署周期只会真正发生一次。
+
+    顺便在这里（同样只会执行一次）做一次显示效果优化——冻结表头、列宽自适应、
+    加边框，详见 _apply_sku_master_display_formatting。
     """
-    return _get_or_create_worksheet(_get_spreadsheet(), SKU_MASTER_SHEET_NAME, SKU_MASTER_HEADERS)
+    ws = _get_or_create_worksheet(_get_spreadsheet(), SKU_MASTER_SHEET_NAME, SKU_MASTER_HEADERS)
+    _apply_sku_master_display_formatting(ws)
+    return ws
 
 
 @st.cache_resource
