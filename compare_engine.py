@@ -157,7 +157,10 @@ def compare_batch(new_records: pd.DataFrame, master_df: pd.DataFrame,
                               fuzzy_threshold, new_tax_rate=new_tax_rate)
         results.append(result)
 
-    return pd.DataFrame(results)
+    cols = ["sku", "status", "new_description", "new_hts", "new_tax_rate",
+            "old_description", "old_hts", "old_tax_rate", "desc_similarity"]
+    # 没有任何记录时（比如整份 PL 的 HTS 都为空）也返回带列名的空表，避免界面按 status 列筛选时报 KeyError
+    return pd.DataFrame(results, columns=cols) if not results else pd.DataFrame(results)
 
 
 def summarize_comparison(comparison_df: pd.DataFrame) -> dict:

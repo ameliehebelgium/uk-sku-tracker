@@ -302,6 +302,15 @@ def parse_packing_list(file_obj_or_path, po_number_hint: str | None = None) -> d
                 po_number = match.group(2).strip()
                 break
 
+    # ---- 1b. 提取柜号（用于在预警里告诉用户是哪个柜子） ----
+    container_no = None
+    for row_idx in range(min(20, len(raw))):
+        row_text = " ".join(str(v) for v in raw.iloc[row_idx].tolist())
+        match = re.search(r"(Container\s*NO\.?|柜号)\s*[:：]?\s*([A-Za-z]{4}\s?\d{6,7}|[A-Za-z0-9\-_/]+)", row_text, re.IGNORECASE)
+        if match:
+            container_no = match.group(2).strip()
+            break
+
     # ---- 2. 定位表头行 ----
     header_idx = _find_header_row(raw)
     if header_idx is None:
@@ -377,18 +386,24 @@ def parse_packing_list(file_obj_or_path, po_number_hint: str | None = None) -> d
 
     extracted["description"] = extracted["description"].replace(r"^\s*$", pd.NA, regex=True)
     extracted["hts"] = extracted["hts"].replace(r"^\s*$", pd.NA, regex=True)
+    # 只在"同一产品内部"继承：品名有值的行 = 新产品的第一行，开启一个新的块；
+    # 品名为空的行 = 同一产品的后续 SKU，才从块内上一行继承 HTS / 税率。
+    # 新产品第一行自己的 HTS / 税率如果是空的，就保持为空（不能偷用上一个产品的），
+    # 后面会把这些 SKU 单独列出来提示。
+    block_id = extracted["description"].notna().cumsum()
     extracted["description"] = extracted["description"].ffill()
-    extracted["hts"] = extracted["hts"].ffill()
+    extracted["hts"] = extracted.groupby(block_id)["hts"].ffill()
 
-    # 税率同样按"同一产品多 SKU 继承上一行"的逻辑 forward-fill（找到税率列时才处理）
+    # 税率同样只在同一产品块内继承（找到税率列时才处理）
     if tax_col_idx is not None:
         extracted["tax_rate_raw"] = extracted["tax_rate_raw"].replace(r"^\s*$", pd.NA, regex=True)
-        extracted["tax_rate_raw"] = extracted["tax_rate_raw"].ffill()
+        extracted["tax_rate_raw"] = extracted.groupby(block_id)["tax_rate_raw"].ffill()
 
     if before_fill_desc_blanks > 0 or before_fill_hts_blanks > 0:
         warnings.append(
             f"检测到 {before_fill_desc_blanks} 行品名为空、{before_fill_hts_blanks} 行 HTS 为空，"
-            f"已自动向上继承上一行的值（同一产品多 SKU 的常见格式）。"
+            f"其中同一产品下的后续 SKU 行已自动继承该产品第一行的值（同一产品多 SKU 的常见格式）；"
+            f"新产品第一行自己缺失的 HTS / 税率不会继承上一个产品的值。"
         )
 
     # ---- 5. 规范化数据类型 ----
@@ -408,11 +423,13 @@ def parse_packing_list(file_obj_or_path, po_number_hint: str | None = None) -> d
     extracted["tax_rate"] = extracted["tax_rate_raw"].apply(_format_tax_rate)
     extracted = extracted.drop(columns=["tax_rate_raw"])
 
-    # 仍有缺失 HTS/description 的行，单独提示（forward-fill 后仍为空，说明文件第一行就缺失）
-    still_missing = extracted[(extracted["hts"] == "") | (extracted["description"] == "") | (extracted["description"].str.lower() == "nan")]
-    if not still_missing.empty:
-        skus = ", ".join(still_missing["sku"].tolist())
-        warnings.append(f"以下 SKU 在 forward-fill 后仍缺少品名或 HTS，请人工检查：{skus}")
+    # HTS 为空的 SKU（新产品第一行就没填 HTS）：单独返回，由界面醒目提示"哪个柜子的哪个 SKU 没有 HS"
+    missing_hts = extracted[extracted["hts"] == ""][["sku", "description"]].reset_index(drop=True)
+    missing_hts.insert(0, "container_no", container_no or "未识别")
+    # 品名缺失的行也提醒一下
+    desc_missing = extracted[(extracted["description"] == "") | (extracted["description"].str.lower() == "nan")]
+    if not desc_missing.empty:
+        warnings.append(f"以下 SKU 缺少品名，请人工检查：{', '.join(desc_missing['sku'].tolist())}")
 
     # 去除同一份 PL 内部重复的 SKU（同一票货里 SKU 不应重复，但保险起见去重）
     duplicated_in_file = extracted[extracted.duplicated(subset=["sku"], keep=False)]
@@ -425,6 +442,8 @@ def parse_packing_list(file_obj_or_path, po_number_hint: str | None = None) -> d
         "success": True,
         "error": None,
         "po_number": po_number,
+        "container_no": container_no,
         "records": extracted[["sku", "description", "hts", "tax_rate"]],
+        "missing_hts": missing_hts,
         "warnings": warnings,
     }

@@ -181,14 +181,26 @@ def _tax_proposed_change(row) -> bool:
 
 
 def _combined_comparison_df(file_results: dict) -> pd.DataFrame:
-    """把本次上传的所有文件的比对结果合并成一个 DataFrame，加一列标注来源文件。"""
+    """把本次上传的所有文件的比对结果合并成一个 DataFrame，加列标注来源文件 / PO / 柜号。
+    HTS 为空的 SKU 以 status = HTS_MISSING 的形式一并放进汇总，下载的文件里也能看到。"""
     frames = []
     for fname, info in file_results.items():
         cdf = info.get("comparison_df")
+        pr = info["parse_result"]
+        parts = []
         if cdf is not None and not cdf.empty:
-            cdf = cdf.copy()
+            parts.append(cdf.copy())
+        miss = pr.get("missing_hts") if pr.get("success") else None
+        if miss is not None and not miss.empty:
+            parts.append(pd.DataFrame({
+                "sku": miss["sku"], "status": "HTS_MISSING",
+                "new_description": miss["description"], "new_hts": "",
+            }))
+        if parts:
+            cdf = pd.concat(parts, ignore_index=True)
             cdf.insert(0, "source_file", fname)
-            cdf.insert(1, "source_po", info["parse_result"].get("po_number") or "")
+            cdf.insert(1, "source_po", pr.get("po_number") or "")
+            cdf.insert(2, "container_no", pr.get("container_no") or "")
             frames.append(cdf)
     if not frames:
         return pd.DataFrame()
@@ -244,8 +256,12 @@ with tab_check:
                         parse_result = parse_packing_list(fobj)
                         comparison_df = None
                         if parse_result["success"]:
+                            # HTS 为空的 SKU 不参与比对、也不会写库（否则会把空 HTS 当成新值覆盖/入库），
+                            # 单独在结果里醒目提示，由用户补全 HTS 后重新上传。
+                            records_all = parse_result["records"]
+                            records_ok = records_all[records_all["hts"].astype(str).str.strip() != ""]
                             comparison_df = compare_batch(
-                                parse_result["records"], master_df, fuzzy_threshold
+                                records_ok, master_df, fuzzy_threshold
                             )
                             # 税率从空值补全为具体数值：品名、HTS 都没变，不是冲突，
                             # 不需要人工逐条确认，这里直接写入数据库。只在"开始解析与比对"
@@ -311,7 +327,25 @@ with tab_check:
             for w in parse_result["warnings"]:
                 st.warning(w)
 
-            st.caption(f"来源 PO/箱单号：{parse_result['po_number'] or '未识别'}")
+            st.caption(
+                f"来源 PO/箱单号：{parse_result['po_number'] or '未识别'}　|　"
+                f"柜号：{parse_result.get('container_no') or '未识别'}"
+            )
+
+            # ---- HTS 为空的 SKU：哪个柜子的哪个 SKU 没有 HS ----
+            missing_hts = parse_result.get("missing_hts")
+            if missing_hts is not None and not missing_hts.empty:
+                st.error(
+                    f"🚨 柜号 {parse_result.get('container_no') or '未识别'}（PO {parse_result['po_number'] or '未识别'}）"
+                    f"有 {len(missing_hts)} 个 SKU 的 HS 编码为空，这些 SKU 未参与比对、也不会写入数据库，"
+                    f"请补全 HS 后重新上传："
+                )
+                st.dataframe(
+                    missing_hts.rename(columns={
+                        "container_no": "柜号", "sku": "SKU", "description": "品名",
+                    }),
+                    width='stretch', hide_index=True,
+                )
 
             summary = summarize_comparison(comparison_df)
             c1, c2, c3, c4, c5, c6 = st.columns(6)
@@ -462,7 +496,8 @@ with tab_check:
 
             if (summary["hts_mismatch"] == 0 and summary["desc_mismatch"] == 0
                     and summary["tax_mismatch"] == 0 and summary["new"] == 0
-                    and summary["tax_autofill"] == 0):
+                    and summary["tax_autofill"] == 0
+                    and (missing_hts is None or missing_hts.empty)):
                 st.info("所有 SKU 均与 UK 数据库一致，无需处理。")
 
 # ---------------------------------------------------------------------------
