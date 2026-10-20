@@ -251,6 +251,8 @@ with tab_check:
                 master_df = load_sku_master()
                 file_results = {}
                 total_autofilled = 0
+                autofill_updates, autofill_logs, autofill_seen = [], [], {}
+                autofill_conflict = {}  # sku -> 在不同文件里 HS/税率不一致的各条记录
                 with st.spinner(f"正在解析并比对 {len(excel_files)} 个文件..."):
                     for fname, fobj in excel_files:
                         parse_result = parse_packing_list(fobj)
@@ -270,23 +272,58 @@ with tab_check:
                             # 调用 update_sku_record——后者一个 SKU 就要发好几个 Google
                             # Sheets API 请求，一批几十个 SKU 循环调用很容易在几秒内打满
                             # 每分钟请求配额、触发 429 报错。
+                            # 这里只"收集"待补全的税率，不在循环里逐文件写库：
+                            # 一次上传一个 zip 可能有几十个文件，逐文件读表+写表会在一分钟内
+                            # 打满 Google Sheets 的请求配额。全部文件处理完后统一写一次（见下方）。
                             autofill_df = comparison_df[comparison_df["status"] == "TAX_AUTOFILL"]
-                            if not autofill_df.empty:
-                                bulk_update_tax_rates([
-                                    {"sku": row["sku"], "tax_rate": row["new_tax_rate"]}
-                                    for _, row in autofill_df.iterrows()
-                                ])
-                                log_entries = [{
-                                    "sku": row["sku"], "field_changed": "tax_rate",
-                                    "old_value": row["old_tax_rate"], "new_value": row["new_tax_rate"],
-                                    "source_po": parse_result["po_number"], "resolution": "auto_filled",
-                                } for _, row in autofill_df.iterrows()]
-                                append_change_log(log_entries)
-                                total_autofilled += len(autofill_df)
+                            for _, row in autofill_df.iterrows():
+                                sku = row["sku"]
+                                hts_norm = str(row["new_hts"]).strip().replace(" ", "").replace("-", "")
+                                this_info = {
+                                    "sku": sku, "hts": hts_norm, "tax": row["new_tax_rate"],
+                                    "container_no": parse_result.get("container_no") or "未识别",
+                                    "po": parse_result.get("po_number") or "未识别",
+                                }
+                                if sku in autofill_conflict:
+                                    autofill_conflict[sku].append(this_info)
+                                    continue
+                                first = autofill_seen.get(sku)
+                                if first is None:
+                                    autofill_seen[sku] = this_info
+                                    autofill_updates.append({"sku": sku, "tax_rate": row["new_tax_rate"]})
+                                    autofill_logs.append({
+                                        "sku": sku, "field_changed": "tax_rate",
+                                        "old_value": row["old_tax_rate"], "new_value": row["new_tax_rate"],
+                                        "source_po": parse_result["po_number"], "resolution": "auto_filled",
+                                    })
+                                elif first["hts"] == hts_norm and first["tax"] == row["new_tax_rate"]:
+                                    continue  # 同一 SKU、HS 和税率都一样：重复出现，只写一次
+                                else:
+                                    # 同一 SKU 在不同文件里 HS（或税率）不一致：不能默认取第一个，
+                                    # 把它从待写入列表里撤下，交给人工确认。
+                                    autofill_updates = [u for u in autofill_updates if u["sku"] != sku]
+                                    autofill_logs = [l for l in autofill_logs if l["sku"] != sku]
+                                    autofill_conflict[sku] = [first, this_info]
                         file_results[fname] = {
                             "parse_result": parse_result,
                             "comparison_df": comparison_df,
                         }
+
+                # 所有文件处理完后，税率自动补全统一写一次（1 次读表 + 1 次批量写入 + 1 次写日志）。
+                # 写库失败时不让整个页面崩掉：比对结果照常展示，并把真实的错误码显示出来方便排查。
+                if autofill_updates:
+                    try:
+                        total_autofilled = bulk_update_tax_rates(autofill_updates)
+                        append_change_log(autofill_logs)
+                    except Exception as e:
+                        resp = getattr(e, "response", None)
+                        detail = getattr(resp, "text", "") or str(e)
+                        st.error(
+                            f"⚠️ 税率自动补全写入 Google Sheet 失败（{type(e).__name__}，"
+                            f"HTTP {getattr(e, 'code', '未知')}）：{detail[:500]}\n\n"
+                            f"比对结果仍然可以正常查看；这次的税率补全没有写入（或只写入了一部分），"
+                            f"处理好原因后重新上传即可。"
+                        )
 
                 st.session_state.file_results = file_results
                 st.session_state.resolved = {}
